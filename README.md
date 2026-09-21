@@ -5,7 +5,7 @@
 ## 当前版本
 
 - Android applicationId: `com.qwen2api.tx`
-- versionName: `1.2.0`
+- versionName: `1.2.1`
 - minSdk: 26
 - targetSdk: 34
 - ABI: `arm64-v8a`

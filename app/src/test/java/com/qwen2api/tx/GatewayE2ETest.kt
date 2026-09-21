@@ -93,7 +93,7 @@ class GatewayE2ETest {
         assertEquals(200, r.code)
         val j = JSONObject(r.body)
         assertEquals(true, j.optBoolean("ok"))
-        assertEquals("1.2.0", j.optString("version"))
+        assertEquals("1.2.1", j.optString("version"))
     }
 
     @Test
@@ -256,7 +256,7 @@ class GatewayE2ETest {
         val r = request("/admin/api/status")
         assertEquals(200, r.code)
         val j = JSONObject(r.body)
-        assertEquals("1.2.0", j.optString("version"))
+        assertEquals("1.2.1", j.optString("version"))
         assertTrue(j.optString("apiKey").startsWith("sk-qpp-"))
         assertNotNull(j.opt("models"))
         assertTrue("应带端口字段", j.has("port"))

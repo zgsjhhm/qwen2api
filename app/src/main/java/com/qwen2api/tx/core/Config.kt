@@ -79,7 +79,7 @@ data class GatewayConfig(
         const val DEFAULT_PORT = 8818
         const val DEFAULT_HOST = "127.0.0.1"
         const val DEFAULT_MODEL = "qwen3.8-max"
-        const val VERSION = "1.2.0"
+        const val VERSION = "1.2.1"
 
         /** 默认重试 2 次（1.5s 起指数退避，总等待上限约 4.5s） */
         const val DEFAULT_IMAGE_RETRY = 2
