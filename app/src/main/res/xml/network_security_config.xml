@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  网络安全策略
+
+  全局禁止明文（cleartextTrafficPermitted=false）：本应用的所有出站流量
+  （chat.qwen.ai、OSS 直传）本来就是 HTTPS，没有任何业务需要明文。
+  此前这里是 <base-config cleartextTrafficPermitted="true"/>，等于给
+  「客户端让手机去拉一个 http:// URL」的路径开了口子 —— 那条路径已被
+  AttachmentResolver 的 https+域名白名单堵住，这里再从系统层收一道。
+
+  只对本机回环开例外：网关自身的监听地址是 127.0.0.1，
+  Windows/Linux 上的 sid/usbmux 转发、以及用户在电脑上配
+  http://127.0.0.1:8818/v1 的客户端都走这条；这是明文唯一合理的去处。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">::1</domain>
+    </domain-config>
+</network-security-config>
