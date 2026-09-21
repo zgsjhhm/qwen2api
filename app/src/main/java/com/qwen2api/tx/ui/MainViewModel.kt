@@ -4,10 +4,12 @@ import android.app.Application
 import android.content.Intent
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.qwen2api.tx.core.AccountStore
 import com.qwen2api.tx.core.ConfigStore
 import com.qwen2api.tx.core.GatewayConfig
 import com.qwen2api.tx.core.Json
 import com.qwen2api.tx.core.LoginCallbackBus
+import com.qwen2api.tx.core.QwenAccount
 import com.qwen2api.tx.core.QwenClient
 import com.qwen2api.tx.core.QwenEvent
 import com.qwen2api.tx.core.QwenException
@@ -47,6 +49,24 @@ data class TestChatState(
 /** 网络诊断步骤 */
 data class DiagStep(val name: String, val ok: Boolean, val ms: Long, val detail: String)
 
+/**
+ * 账号行（UI 展示用）。
+ *
+ * 与 [com.qwen2api.tx.core.AccountStatus] 的区别：后者是路由算出的**健康视图**
+ *（含冷却剩余），本类型是用户**管理**账号需要的字段（是否启用、上次用的时间、
+ * 掩码后的凭证）。两者合并会让 UI 被迫关心冷却计算，而冷却时长与配置耦合，
+ * 不该出现在列表行里。
+ */
+data class AccountRow(
+    val id: String,
+    val label: String,
+    val masked: String,
+    val enabled: Boolean,
+    val lastUsedAt: Long = 0L,
+    val lastError: String = "",
+    val lastErrorCode: String = "",
+)
+
 data class UiState(
     val config: GatewayConfig = GatewayConfig(),
     val serviceRunning: Boolean = false,
@@ -63,6 +83,18 @@ data class UiState(
     val test: TestChatState = TestChatState(),
     val settingsNotice: String? = null,
     val copiedHint: String? = null,
+    /** 账号列表（多账号路由的实际参与方） */
+    val accounts: List<AccountRow> = emptyList(),
+    /** 账号卡片上的提示（新增/删除/验证结果） */
+    val accountNotice: Notice? = null,
+    /** 累计调用统计与最近一次失败 */
+    val logTotal: Long = 0L,
+    val logFails: Long = 0L,
+    val lastFailure: String = "",
+    /** 最近的调用日志（由新到旧，已按 UI 上限截断） */
+    val logRows: List<com.qwen2api.tx.core.ApiLogEntry> = emptyList(),
+    /** 0 = 服务进程尚未创建路由（账号/日志为空的原因是"没启动"，不是"没有"） */
+    val logSourceReady: Boolean = false,
 )
 
 /**
@@ -130,10 +162,148 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     qwenOk = GatewayState.qwenOk,
                     reqCount = GatewayState.reqCount,
                 )
+                refreshAccounts()
                 delay(800)
             }
         }
     }
+
+    // ---------------- 账号（多账号路由） ----------------
+
+    /**
+     * 回读账号列表与调用统计。
+     *
+     * 走 [GatewayService.activeRouter] 而不是门面单例：账号列表**必须在服务进程
+     * 持有的那份仓储上读**，因为路由用的是它。若这里另建一个仓储实例，
+     * 会出现「UI 里删掉的账号，网关这一轮还在用」——两者看着是同一份数据，
+     * 实际是两个对象，是最难自查的一类不一致。
+     */
+    fun refreshAccounts() {
+        val repo = GatewayService.activeRouter
+        val list = repo?.accountRepository()
+        val store = repo?.logStoreRef()
+        _ui.value = _ui.value.copy(
+            accounts = list?.all()?.map { a ->
+                AccountRow(
+                    id = a.id,
+                    label = a.displayName(),
+                    masked = ConfigStore.maskToken(a.credential),
+                    enabled = a.enabled,
+                    lastUsedAt = a.lastUsedAt,
+                    lastError = a.lastError,
+                    lastErrorCode = a.lastErrorCode,
+                )
+            }.orEmpty(),
+            logSourceReady = repo != null,
+            logTotal = store?.totalCount ?: 0L,
+            logFails = store?.failCount ?: 0L,
+            lastFailure = store?.lastFailure.orEmpty(),
+            logRows = store?.recent(LOG_ROWS_LIMIT).orEmpty(),
+        )
+    }
+
+    /**
+     * 新增账号：先验证再落库。
+     *
+     * 顺序刻意如此：先验证可以避免把坏凭证写进列表（否则用户要在真正发请求时
+     * 才看到错误，且错误会混在业务错误里，很难归因到"某个账号配错了"）。
+     */
+    fun addAccount(raw: String, label: String) {
+        val repo = GatewayService.activeRouter?.accountRepository()
+        if (repo == null) {
+            setAccountNotice(Notice.Kind.BAD, "网关未启动：账号列表由网关持有，请先启动网关服务")
+            return
+        }
+        val san = AccountStore.build(raw, label)
+        if (!san.ok) {
+            setAccountNotice(Notice.Kind.BAD, san.message)
+            return
+        }
+        // 凭证重复 = 切换账号会切到同一个账号上，表现为"换了但错误一模一样"。
+        // 这里直接拦下并说清原因，比让用户自己去发现"两个账号长得差不多"友好得多。
+        val dup = repo.all().firstOrNull { it.credential == san.token }
+        if (dup != null) {
+            setAccountNotice(Notice.Kind.BAD, "该凭证已存在于账号「${dup.displayName()}」，无需重复添加")
+            return
+        }
+        val acc = QwenAccount(
+            id = AccountStore.newId(),
+            label = label.trim(),
+            credential = san.token,
+            createdAt = System.currentTimeMillis(),
+        )
+        repo.upsert(acc)
+        refreshAccounts()
+        setAccountNotice(Notice.Kind.INFO, "已保存账号「${acc.displayName()}」，正在验证…")
+        viewModelScope.launch {
+            val msg = try {
+                val models = withContext(Dispatchers.IO) {
+                    QwenClient("", 0).also { it.credentialOverride = acc.credential }.listModels()
+                }
+                "✓ 账号「${acc.displayName()}」验证通过（${models.size} 个模型可用）"
+                    .let { it + if (san.note.isNotEmpty()) "。${san.note}" else "" }
+            } catch (e: Exception) {
+                "账号已保存，但验证未通过：${e.message ?: "未知错误"}（该账号会被路由自动跳过并在冷却后重试）"
+            }
+            setAccountNotice(if (msg.startsWith("✓")) Notice.Kind.OK else Notice.Kind.BAD, msg)
+            refreshAccounts()
+        }
+    }
+
+    fun setAccountEnabled(id: String, enabled: Boolean) {
+        val repo = GatewayService.activeRouter?.accountRepository() ?: return
+        val a = repo.find(id) ?: return
+        repo.upsert(a.copy(enabled = enabled))
+        refreshAccounts()
+        setAccountNotice(Notice.Kind.INFO, if (enabled) "已启用「${a.displayName()}」" else "已停用「${a.displayName()}」")
+    }
+
+    fun removeAccount(id: String) {
+        val repo = GatewayService.activeRouter?.accountRepository() ?: return
+        val gone = repo.remove(id) ?: return
+        refreshAccounts()
+        setAccountNotice(Notice.Kind.INFO, "已删除账号「${gone.displayName()}」")
+    }
+
+    /** 手动清空全部账号的健康记录（过完滑块后想立刻恢复时用） */
+    fun resetAccountHealth() {
+        val repo = GatewayService.activeRouter?.accountRepository() ?: return
+        var n = 0
+        repo.all().forEach { a ->
+            if (a.lastError.isNotEmpty() || a.lastErrorAt > 0L) n++
+            repo.upsert(a.copy(lastError = "", lastErrorCode = "", lastErrorAt = 0L))
+        }
+        refreshAccounts()
+        setAccountNotice(
+            Notice.Kind.OK,
+            if (n == 0) "所有账号本就是健康状态" else "已重置 $n 个账号的失败记录，它们会立即重新参与轮转",
+        )
+    }
+
+    /** 清空调用日志（含累计统计与落盘文件） */
+    fun clearLogs() {
+        val store = GatewayService.activeRouter?.logStoreRef() ?: return
+        store.clear()
+        refreshAccounts()
+        setAccountNotice(Notice.Kind.INFO, "已清空调用日志")
+    }
+
+    private fun setAccountNotice(kind: Notice.Kind, text: String) {
+        _ui.value = _ui.value.copy(accountNotice = Notice(kind, text))
+    }
+
+    fun dismissAccountNotice() {
+        _ui.value = _ui.value.copy(accountNotice = null)
+    }
+
+    /**
+     * 导出调用日志为可分享的 Markdown 文本。
+     *
+     * @param includeTrace 是否附带每条请求的诊断行（体积大但定位价值高）
+     * @return 日志文本；服务未启动（拿不到仓储）时返回 null
+     */
+    fun exportLogs(includeTrace: Boolean = true): String? =
+        GatewayService.activeRouter?.logStoreRef()?.exportText(includeTrace = includeTrace)
 
     // ---------------- 配置 ----------------
 
@@ -305,6 +475,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         systemPrompt: String = ConfigStore.load(ctx).systemPrompt,
         systemPromptEnabled: Boolean = ConfigStore.load(ctx).systemPromptEnabled,
         systemPromptMode: String = ConfigStore.load(ctx).systemPromptMode,
+        multiAccount: Boolean = ConfigStore.load(ctx).multiAccount,
+        accountCooldownMs: Int = ConfigStore.load(ctx).accountCooldownMs,
+        maxAccountSwitches: Int = ConfigStore.load(ctx).maxAccountSwitches,
     ) {
         val old = ConfigStore.load(ctx)
         ConfigStore.update(ctx) { it.copyWith(
@@ -324,6 +497,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             systemPrompt = ConfigStore.sanitizeSystemPrompt(systemPrompt),
             systemPromptEnabled = systemPromptEnabled,
             systemPromptMode = ConfigStore.normalizeSystemPromptMode(systemPromptMode),
+            multiAccount = multiAccount,
+            // 冷却时长必须夹紧到 [0, MAX_ACCOUNT_COOLDOWN]，理由见 Config.kt 里
+            // MAX_ACCOUNT_COOLDOWN 的说明：填过大的值会让账号在本进程内永远不被选中，
+            // 而界面上只显示"冷却中"，用户很难意识到是自己把分钟当秒填了。
+            accountCooldownMs = accountCooldownMs.coerceIn(0, GatewayConfig.MAX_ACCOUNT_COOLDOWN),
+            maxAccountSwitches = maxAccountSwitches.coerceIn(0, GatewayConfig.MAX_ACCOUNT_SWITCHES),
         ) }
         val portChanged = old.port != port.coerceIn(1, 65535)
         _ui.value = _ui.value.copy(
@@ -590,5 +769,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setCopiedHint(text: String?) {
         _ui.value = _ui.value.copy(copiedHint = text)
+    }
+
+    private companion object {
+        /**
+         * 日志页在内存里保留的条数上限。
+         *
+         * 比 [com.qwen2api.tx.core.ApiLogStore.MAX_ENTRIES]（400）小：列表每 800ms
+         * 随 ticker 重建一次，条数越多重组越贵，而用户在手机上翻不了几百条。
+         * 需要全量时走「导出」——那里读的是仓储的完整窗口。
+         */
+        const val LOG_ROWS_LIMIT = 60
     }
 }

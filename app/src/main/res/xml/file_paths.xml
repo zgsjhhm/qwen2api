@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    分享导出日志时允许暴露的目录。
+
+    只映射 cacheDir/log-export（与 LogExportIo 写出的路径一致，见 MainViewModel 的导出逻辑）：
+    范围越窄越好 —— 一旦某个目录被映射，该目录下的任何文件都能被分享出去，
+    而应用私有目录里还存着账号凭证与会话缓存，不该有这个面。
+
+    cacheDir 而非 filesDir：导出物是临时的，系统在存储紧张时可以自动回收，
+    而 api_call_log.jsonl 本体留在 filesDir（不在此映射内）。
+-->
+<paths>
+    <cache-path name="log-export" path="log-export/" />
+</paths>

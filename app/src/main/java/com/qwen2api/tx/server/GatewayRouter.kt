@@ -3,15 +3,23 @@ package com.qwen2api.tx.server
 import android.content.Context
 
 import com.qwen2api.tx.BuildConfig
+import com.qwen2api.tx.core.AccountRepository
+import com.qwen2api.tx.core.AccountRouter
+import com.qwen2api.tx.core.AccountStore
+import com.qwen2api.tx.core.ApiLogLevel
+import com.qwen2api.tx.core.ApiLogStore
 import com.qwen2api.tx.core.AttachmentKind
 import com.qwen2api.tx.core.B64
 import com.qwen2api.tx.core.ChatMessage
 import com.qwen2api.tx.core.ConfigRepository
 import com.qwen2api.tx.core.ConfigStore
+import com.qwen2api.tx.core.CredentialRoute
 import com.qwen2api.tx.core.FileRecord
 import com.qwen2api.tx.core.FileStore
 import com.qwen2api.tx.core.GatewayConfig
 import com.qwen2api.tx.core.Json
+import com.qwen2api.tx.core.MemoryAccountRepository
+import com.qwen2api.tx.core.QwenAccount
 import com.qwen2api.tx.core.QwenClient
 import com.qwen2api.tx.core.QwenEvent
 import com.qwen2api.tx.core.QwenImageClient
@@ -53,6 +61,16 @@ object GatewayState {
      * 不必守着 logcat 复现。
      */
     @Volatile var lastImageLog: String = ""
+
+    /**
+     * 最近一次请求的账号路由结果摘要（含尝试次数/切换次数）。
+     *
+     * 与 [lastRequestLog] 的区别：后者是"哪个 URL 回了什么状态码"，
+     * 本字段回答的是"这次为什么慢、有没有换账号"——排查多账号场景时最先要看的东西。
+     */
+    @Volatile var lastAccountRoute: String = ""
+
+    @Volatile var lastRouteSummary: String = ""
 }
 
 /**
@@ -99,13 +117,47 @@ class GatewayRouter(
             retryBackoffMs = cfg.imageRetryBackoffMs.toLong(),
         )
     },
+    /**
+     * 账号仓储（多账号路由）。
+     *
+     * 默认值为"空账号列表的内存实现"而不是生产实现：构造器里有 `Context?`，
+     * 而单测传的是 null（纯 JVM）。默认空列表使"没有账号"成为最自然的初始状态 ——
+     * 此时路由退化到只用 `cfg.qwenToken`，与改动前行为一致。
+     * 生产构造器（带 context 那个）会注入真正的持久化实现。
+     */
+    private val accountRepo: AccountRepository = MemoryAccountRepository(),
+    /**
+     * 调用日志仓储。
+     *
+     * 同上：默认内存实现便于测试，生产构造器注入落盘实现。
+     */
+    private val logStore: ApiLogStore = ApiLogStore.inMemory(),
 ) {
     /** 生产环境构造器：使用 SharedPreferences 持久化 */
     constructor(context: Context) : this(
         context.applicationContext,
         ConfigStore.repository(context),
         FileRegistry(context),
+        accountRepo = AccountStore.repository(context),
+        logStore = ApiLogStore.forContext(context),
     )
+
+    /**
+     * 账号路由：把凭证选择/健康度/冷却收敛到一个对象里。
+     *
+     * 与 [GatewayRouter] 一起构造（而不是每请求新建）：健康度与冷却本身就是
+     * **跨请求**的状态，每次新建就等于每次忘记。
+     */
+    private val accountRouter = AccountRouter(
+        accountRepo,
+        configRepo,
+        log = { msg -> logRoute(msg) },
+    )
+
+    /** UI/管理接口读取账号与日志的入口 */
+    fun accountRepository(): AccountRepository = accountRepo
+
+    fun logStoreRef(): ApiLogStore = logStore
 
     /** 测试构造器：纯内存依赖 */
     constructor(configRepo: ConfigRepository, fileStore: FileStore) : this(null, configRepo, fileStore)
@@ -247,6 +299,16 @@ class GatewayRouter(
         pathname == "/admin/api/check" -> listOf("POST")
         pathname == "/admin/api/settings" -> listOf("POST")
         pathname == "/admin/api/key/regenerate" -> listOf("POST")
+        pathname == "/admin/api/accounts" -> listOf("GET", "HEAD")
+        pathname == "/admin/api/logs" -> listOf("GET", "HEAD")
+        pathname == "/admin/api/logs/export" -> listOf("GET", "HEAD")
+        // 这几个都是 POST-only；写成 || 串联而不是逗号：本 when 是无主语的
+        // 条件式（`when { 条件 -> }`），逗号只在 `when (主语) { 值, 值 -> }` 里合法。
+        pathname == "/admin/api/accounts/add" ||
+            pathname == "/admin/api/accounts/update" ||
+            pathname == "/admin/api/accounts/remove" ||
+            pathname == "/admin/api/accounts/reset" ||
+            pathname == "/admin/api/logs/clear" -> listOf("POST")
         pathname.startsWith("/admin/") -> null
         else -> null
     }
@@ -348,6 +410,91 @@ class GatewayRouter(
     }
 
     private fun newClient(cfg: GatewayConfig) = clientFactory(cfg)
+
+    // ---------------- 多账号路由 ----------------
+
+    /**
+     * 按当前配置算出本次请求的凭证尝试顺序。
+     *
+     * 关闭多账号（`cfg.multiAccount == false`）时**退化成单账号**：
+     * 只返回默认账号，因此后续所有上下文错误处理行为与改动前完全一致。
+     * 这是刻意留的回退开关 —— 多账号路由一旦出问题，用户需要一个
+     * "立刻变回老行为"的动作，而不是等修版本。
+     */
+    private fun credentialPlan(cfg: GatewayConfig): List<CredentialRoute> {
+        if (!cfg.multiAccount) {
+            return if (cfg.qwenToken.isBlank()) {
+                emptyList()
+            } else {
+                listOf(CredentialRoute("", "默认账号", cfg.qwenToken))
+            }
+        }
+        val all = accountRouter.candidates(cfg)
+        // 切换次数上限在这里生效，而不是靠调用方各自 break：
+        // 五条链路（models/图片/改图/非流式/流式/上传）都从这一个入口拿计划，
+        // 在此截断才能保证"上限"对**所有**链路一致生效。上限语义是"最多切换 N 次"，
+        // 即最多尝试 N+1 个凭证。
+        val maxAttempts = cfg.maxAccountSwitches + 1
+        return if (all.size <= maxAttempts) all else all.subList(0, maxAttempts)
+    }
+
+    /**
+     * 对话链路的凭证计划。
+     *
+     * 与图片/文件链路**刻意不同**：后者在改动前就预检 token 并回 400/`no_token`，
+     * 而对话链路从不预检 —— 未配置时由 [QwenClient] 抛 `NO_TOKEN`（HTTP 401）。
+     * 这个差异被既有 E2E 测试固化（「chat without qwen token reports actionable
+     * error」断言 401 + NO_TOKEN），因此这里在无候选时返回一个**空凭证的默认路由**
+     * 让客户端照旧抛错，而不是换成 400。顺带一个副作用是好的：流式请求在
+     * 未配置凭证时仍能先建立 SSE（否则客户端拿到的是一段 JSON，而不是可解析的
+     * 错误帧），与改动前逐字节一致。
+     */
+    private fun chatCredentialPlan(cfg: GatewayConfig): List<CredentialRoute> {
+        val plan = credentialPlan(cfg)
+        if (plan.isNotEmpty()) return plan
+        return listOf(CredentialRoute("", "默认账号", ""))
+    }
+
+    /** 记一次成功：清空该账号的失败记录（退出冷却） */
+    private fun noteRouteOk(route: CredentialRoute) {
+        try {
+            accountRouter.noteOk(route)
+        } catch (e: Exception) {
+            debugLog("noteRouteOk failed: ${e.message}")
+        }
+    }
+
+    /** 记一次失败（仅可切换类错误才写冷却，见 [AccountRouter.shouldSwitch]） */
+    private fun noteRouteFail(route: CredentialRoute, e: QwenException, switchable: Boolean) {
+        try {
+            accountRouter.noteFail(route, e, switchable)
+        } catch (ex: Exception) {
+            debugLog("noteRouteFail failed: ${ex.message}")
+        }
+    }
+
+    /** 记一次"用过"（写 lastUsedAt，供轮转与 UI 展示） */
+    private fun noteRouteUsed(route: CredentialRoute) {
+        try {
+            accountRouter.noteUsed(route)
+        } catch (e: Exception) {
+            debugLog("noteRouteUsed failed: ${e.message}")
+        }
+    }
+
+    /** 无可用凭证时向调用方回一个可读错误（而不是让上游返回 401 让人猜） */
+    private fun noCredentialError(res: HttpResponse) {
+        sendJson(
+            res, 400,
+            mapOf(
+                "error" to mapOf(
+                    "message" to "请先在应用内配置 Qwen token 或添加账号",
+                    "type" to "invalid_request_error",
+                    "code" to "no_token",
+                ),
+            ),
+        )
+    }
 
     /**
      * 创建文生图客户端并**接上日志出口**。
@@ -473,23 +620,63 @@ class GatewayRouter(
             return sendJson(res, 200, openAiModels(cached))
         }
         val fresh = configRepo.load()
-        try {
-            val models = newClient(fresh).listModels()
-            GatewayState.modelsCache = models
-            GatewayState.modelsCacheAt = System.currentTimeMillis()
-            GatewayState.qwenOk = true
-            GatewayState.qwenCheckAt = System.currentTimeMillis()
-            sendJson(res, 200, openAiModels(models))
-        } catch (e: QwenException) {
-            if (e.code == "AUTH_FAILED") {
-                GatewayState.qwenOk = false
-                GatewayState.qwenCheckAt = System.currentTimeMillis()
-                return sendError(res, e)
-            }
-            // 拉取失败 -> 兜底旧缓存 / 静态列表（仍可调用）
-            val fallback = cached ?: QwenClient.FALLBACK_MODELS
-            sendJson(res, 200, openAiModels(fallback))
+        val trace = logBegin(req)
+        val plan = credentialPlan(fresh)
+        if (plan.isEmpty()) {
+            logFinish(trace, 400, errorCode = "no_token", message = "未配置 Qwen token")
+            noCredentialError(res)
+            return
         }
+        var attempts = 0
+        var switches = 0
+        var lastErr: QwenException? = null
+        var lastRoute: CredentialRoute? = null
+        var ci = 0
+        while (ci < plan.size) {
+            val route = plan[ci]
+            val hasNext = ci < plan.size - 1
+            attempts++
+            lastRoute = route
+            try {
+                val models = newClient(fresh).also { it.credentialOverride = route.credential }.listModels()
+                GatewayState.modelsCache = models
+                GatewayState.modelsCacheAt = System.currentTimeMillis()
+                GatewayState.qwenOk = true
+                GatewayState.qwenCheckAt = System.currentTimeMillis()
+                noteRouteOk(route)
+                trace.line("账号 ${route.label} 拉到 ${models.size} 个模型")
+                logFinish(trace, 200, route, attempts, switches, summary = "${models.size} models")
+                return sendJson(res, 200, openAiModels(models))
+            } catch (e: QwenException) {
+                lastErr = e
+                val switchable = hasNext && accountRouter.shouldSwitch(e)
+                noteRouteFail(route, e, switchable)
+                trace.line("账号 ${route.label} 失败: [${e.code}] ${e.message}")
+                // AUTH_FAILED 是这个账号自己的问题，正好是多账号路由最有价值的场景：
+                // 旧实现直接把它抛给调用方（调用方拿着一个可用的备用账号却什么都不知道）。
+                if (!switchable) break
+                switches++
+                kotlinx.coroutines.delay(SWITCH_PAUSE_MS)
+                ci++
+            }
+        }
+        val err = lastErr
+        if (err != null && err.code == "AUTH_FAILED") {
+            GatewayState.qwenOk = false
+            GatewayState.qwenCheckAt = System.currentTimeMillis()
+            logFinish(trace, err.status, lastRoute, attempts, switches, err.code, err.message)
+            return sendError(res, err)
+        }
+        // 拉取失败 -> 兜底旧缓存 / 静态列表（仍可调用）。
+        // 注意这不记为失败：对调用方而言这是一次成功的响应（拿到了可用模型列表），
+        // 把它记成 FAIL 会让日志里"失败率"虚高，掩盖真正的错误。
+        val fallback = cached ?: QwenClient.FALLBACK_MODELS
+        logFinish(
+            trace, 200, lastRoute, attempts, switches,
+            summary = "fallback ${fallback.size} models" +
+                (err?.message?.let { " (上游: ${it.take(80)})" } ?: ""),
+        )
+        sendJson(res, 200, openAiModels(fallback))
     }
 
     // ---------------- /v1/images/generations ----------------
@@ -578,17 +765,11 @@ class GatewayRouter(
 
         val t0 = System.currentTimeMillis()
         val fresh = configRepo.load()
-        if (fresh.qwenToken.isBlank()) {
-            return sendJson(
-                res, 400,
-                mapOf(
-                    "error" to mapOf(
-                        "message" to "请先在应用内配置 Qwen token",
-                        "type" to "invalid_request_error",
-                        "code" to "no_token",
-                    ),
-                ),
-            )
+        val plan = credentialPlan(fresh)
+        if (plan.isEmpty()) {
+            logFinish(logBegin(req), 400, errorCode = "no_token", message = "未配置 Qwen token")
+            noCredentialError(res)
+            return
         }
 
         val responseFormat = Json.str(body, "response_format", "url").lowercase()
@@ -611,38 +792,70 @@ class GatewayRouter(
             b64Only = wantB64,
         )
 
-        val client = newImageClient(fresh)
-        try {
-            val result = withContext(Dispatchers.IO) { client.generateImage(imageReq) }
-            val data = buildImageData(client, result, prompt, wantB64)
-            val payload = LinkedHashMap<String, Any?>()
-            payload["created"] = Util.nowSec()
-            payload["data"] = data
-            // 网关扩展字段：不放标准位，只作为排查线索
-            payload["qwen"] = mapOf(
-                "model" to result.model,
-                "size" to result.size,
-                "caption" to result.caption,
-                // 与 edits 对齐：排查「偶发 502」时必须能看出网关重试了没有
-                "retries" to result.retries,
-                "downloaded_b64" to if (wantB64) {
-                    data.count { (it["b64_json"] as? String).orEmpty().isNotEmpty() }
-                } else {
-                    null
-                },
-            )
-            logReq(req, 200, System.currentTimeMillis() - t0, "img ${result.images.size}x ${result.model}")
-            sendJson(res, 200, payload)
-        } catch (e: Exception) {
-            val err = if (e is QwenException) e else {
-                val (c, m, s) = Util.normalizeError(e); QwenException(c, m, s)
+        // 出图在整个过程中**一个字节都没写给调用方**（响应是最后一次性 sendJson），
+        // 因此任何可切换类失败都能换账号重来。这与对话链路的约束完全不同 ——
+        // 那里一旦下发过 thinking/content 就锁住了。
+        val trace = logBegin(req, model = reqModel)
+        var attempts = 0
+        var switches = 0
+        var lastErr: QwenException? = null
+        var lastRoute: CredentialRoute? = null
+        var ci = 0
+        while (ci < plan.size) {
+            val route = plan[ci]
+            val hasNext = ci < plan.size - 1
+            attempts++
+            lastRoute = route
+            val client = newImageClient(fresh).also { it.credentialOverride = route.credential }
+            try {
+                val result = withContext(Dispatchers.IO) { client.generateImage(imageReq) }
+                val data = buildImageData(client, result, prompt, wantB64)
+                trace.line("账号 ${route.label} 出图 ${result.images.size} 张 · 内部重试 ${result.retries} 次")
+                noteRouteOk(route)
+                val payload = LinkedHashMap<String, Any?>()
+                payload["created"] = Util.nowSec()
+                payload["data"] = data
+                // 网关扩展字段：不放标准位，只作为排查线索
+                payload["qwen"] = mapOf(
+                    "model" to result.model,
+                    "size" to result.size,
+                    "caption" to result.caption,
+                    // 与 edits 对齐：排查「偶发 502」时必须能看出网关重试了没有
+                    "retries" to result.retries,
+                    "downloaded_b64" to if (wantB64) {
+                        data.count { (it["b64_json"] as? String).orEmpty().isNotEmpty() }
+                    } else {
+                        null
+                    },
+                )
+                logReqTrack(
+                    req, 200, System.currentTimeMillis() - t0,
+                    "img ${result.images.size}x ${result.model}", route, attempts, switches, reqModel,
+                )
+                logFinish(trace, 200, route, attempts, switches, summary = "img ${result.images.size}x")
+                return sendJson(res, 200, payload)
+            } catch (e: Exception) {
+                val err = if (e is QwenException) e else {
+                    val (c, m, s) = Util.normalizeError(e); QwenException(c, m, s)
+                }
+                lastErr = err
+                val switchable = hasNext && accountRouter.shouldSwitch(err)
+                noteRouteFail(route, err, switchable)
+                trace.line("账号 ${route.label} 失败: [${err.code}] ${err.message}")
+                if (!switchable) break
+                switches++
+                logRoute("${route.label} 出图失败(${err.code}) → 切换到下一个账号")
+                kotlinx.coroutines.delay(SWITCH_PAUSE_MS)
+                ci++
             }
-            logReq(
-                req, err.status, System.currentTimeMillis() - t0,
-                "[${err.code}] retries=${err.attempts}",
-            )
-            sendError(res, err)
         }
+        val err = lastErr ?: QwenException("UPSTREAM_ERROR", "出图失败", 502)
+        logReqTrack(
+            req, err.status, System.currentTimeMillis() - t0,
+            "[${err.code}] retries=${err.attempts}", lastRoute, attempts, switches, reqModel,
+        )
+        logFinish(trace, err.status, lastRoute, attempts, switches, err.code, err.message)
+        sendError(res, err)
     }
 
     // ---------------- /v1/images/edits（图生图） ----------------
@@ -837,17 +1050,11 @@ class GatewayRouter(
 
         val t0 = System.currentTimeMillis()
         val fresh = configRepo.load()
-        if (fresh.qwenToken.isBlank()) {
-            return sendJson(
-                res, 400,
-                mapOf(
-                    "error" to mapOf(
-                        "message" to "请先在应用内配置 Qwen token",
-                        "type" to "invalid_request_error",
-                        "code" to "no_token",
-                    ),
-                ),
-            )
+        val plan = credentialPlan(fresh)
+        if (plan.isEmpty()) {
+            logFinish(logBegin(req), 400, errorCode = "no_token", message = "未配置 Qwen token")
+            noCredentialError(res)
+            return
         }
 
         val reqModel = QwenImageClient.normalizeModel(model)
@@ -862,50 +1069,81 @@ class GatewayRouter(
             b64Only = wantB64,
         )
 
-        val client = newImageClient(fresh)
-        try {
-            val result = withContext(Dispatchers.IO) { client.generateImageEdit(editReq) }
-            val data = buildImageData(client, result, prompt, wantB64)
-            val payload = LinkedHashMap<String, Any?>()
-            payload["created"] = Util.nowSec()
-            payload["data"] = data
-            payload["qwen"] = LinkedHashMap<String, Any?>().apply {
-                put("model", result.model)
-                put("size", result.size)
-                put("caption", result.caption)
-                put("source_count", sources.size)
-                put("retries", result.retries)
-                put("downloaded_b64", if (wantB64) {
-                    data.count { (it["b64_json"] as? String).orEmpty().isNotEmpty() }
-                } else {
-                    null
-                })
-                // mask 被忽略时必须说出来。静默忽略会让调用方以为做了局部重绘，
-                // 而结果其实是整图重画 —— 这类"成功但不对"最难定位。
-                if (droppedMask.isNotEmpty()) {
-                    put("ignored_mask", droppedMask)
-                    put(
-                        "ignored_mask_hint",
-                        "上游图生图没有独立蒙版通道，mask 已忽略（整图重绘）；" +
-                            "需要局部修改请直接在图里圈出区域或用提示词描述",
-                    )
+        // 同文生图：源图会随账号重新上传（文件 id 与凭证绑定），因此每轮各自处理。
+        val trace = logBegin(req, model = reqModel)
+        var attempts = 0
+        var switches = 0
+        var lastErr: QwenException? = null
+        var lastRoute: CredentialRoute? = null
+        var ci = 0
+        while (ci < plan.size) {
+            val route = plan[ci]
+            val hasNext = ci < plan.size - 1
+            attempts++
+            lastRoute = route
+            val client = newImageClient(fresh).also { it.credentialOverride = route.credential }
+            try {
+                val result = withContext(Dispatchers.IO) { client.generateImageEdit(editReq) }
+                val data = buildImageData(client, result, prompt, wantB64)
+                trace.line(
+                    "账号 ${route.label} 改图 ${result.images.size} 张 · 源图 ${sources.size} 张" +
+                        " · 内部重试 ${result.retries} 次",
+                )
+                noteRouteOk(route)
+                val payload = LinkedHashMap<String, Any?>()
+                payload["created"] = Util.nowSec()
+                payload["data"] = data
+                payload["qwen"] = LinkedHashMap<String, Any?>().apply {
+                    put("model", result.model)
+                    put("size", result.size)
+                    put("caption", result.caption)
+                    put("source_count", sources.size)
+                    put("retries", result.retries)
+                    put("downloaded_b64", if (wantB64) {
+                        data.count { (it["b64_json"] as? String).orEmpty().isNotEmpty() }
+                    } else {
+                        null
+                    })
+                    // mask 被忽略时必须说出来。静默忽略会让调用方以为做了局部重绘，
+                    // 而结果其实是整图重画 —— 这类"成功但不对"最难定位。
+                    if (droppedMask.isNotEmpty()) {
+                        put("ignored_mask", droppedMask)
+                        put(
+                            "ignored_mask_hint",
+                            "上游图生图没有独立蒙版通道，mask 已忽略（整图重绘）；" +
+                                "需要局部修改请直接在图里圈出区域或用提示词描述",
+                        )
+                    }
                 }
+                logReqTrack(
+                    req, 200, System.currentTimeMillis() - t0,
+                    "edit ${result.images.size}x ${result.model} src=${sources.size}",
+                    route, attempts, switches, reqModel,
+                )
+                logFinish(trace, 200, route, attempts, switches, summary = "edit ${result.images.size}x")
+                return sendJson(res, 200, payload)
+            } catch (e: Exception) {
+                val err = if (e is QwenException) e else {
+                    val (c, m, s) = Util.normalizeError(e); QwenException(c, m, s)
+                }
+                lastErr = err
+                val switchable = hasNext && accountRouter.shouldSwitch(err)
+                noteRouteFail(route, err, switchable)
+                trace.line("账号 ${route.label} 失败: [${err.code}] ${err.message}")
+                if (!switchable) break
+                switches++
+                logRoute("${route.label} 改图失败(${err.code}) → 切换到下一个账号")
+                kotlinx.coroutines.delay(SWITCH_PAUSE_MS)
+                ci++
             }
-            logReq(
-                req, 200, System.currentTimeMillis() - t0,
-                "edit ${result.images.size}x ${result.model} src=${sources.size}",
-            )
-            sendJson(res, 200, payload)
-        } catch (e: Exception) {
-            val err = if (e is QwenException) e else {
-                val (c, m, s) = Util.normalizeError(e); QwenException(c, m, s)
-            }
-            logReq(
-                req, err.status, System.currentTimeMillis() - t0,
-                "[${err.code}] retries=${err.attempts}",
-            )
-            sendError(res, err)
         }
+        val err = lastErr ?: QwenException("UPSTREAM_ERROR", "图生图失败", 502)
+        logReqTrack(
+            req, err.status, System.currentTimeMillis() - t0,
+            "[${err.code}] retries=${err.attempts}", lastRoute, attempts, switches, reqModel,
+        )
+        logFinish(trace, err.status, lastRoute, attempts, switches, err.code, err.message)
+        sendError(res, err)
     }
 
     /** multipart 里哪些字段名算「源图」 */
@@ -1149,9 +1387,155 @@ class GatewayRouter(
         return nonStreamChat(req, res, cfg, body)
     }
 
+    private suspend fun nonStreamChat(req: HttpRequest, res: HttpResponse, cfg: GatewayConfig, body: JSONObject) {
+        val t1 = System.currentTimeMillis()
+        val messages = parseMessages(body)
+        if (messages.isEmpty()) {
+            return sendJson(
+                res, 400,
+                mapOf(
+                    "error" to mapOf(
+                        "message" to "messages is required",
+                        "type" to "invalid_request_error",
+                        "code" to "bad_request",
+                    ),
+                ),
+            )
+        }
+        val model = Json.str(body, "model").ifEmpty { cfg.defaultModel }
+        val thinking = if (body.has("thinking")) Json.bool(body, "thinking", true) else cfg.thinking
+
+        // 方案 B：非流式下先把工具定义注入成提示词
+        // 顺序同 streamChat：全局 System Prompt 先注入（只碰 system 角色），
+        // 再由 ToolInjector 追加工具说明到最后一条 user 消息末尾。
+        val sysCtx = SystemPromptInjector.prepare(messages, cfg)
+        val toolCtx = ToolInjector.prepare(messages, body)
+        debugLog(
+            "nonstream req: model=$model tools=" + (body.optJSONArray("tools")?.length() ?: 0) +
+                " sysPrompt=" + sysCtx.applied + "/" + sysCtx.mode,
+        )
+        // 注入只做一次（原地改写 messages），账号轮次之间复用
+        val prepared = messages
+
+        // 对话链路用 chatCredentialPlan：无凭证时不预检，交给 QwenClient 抛 NO_TOKEN。
+        val plan = chatCredentialPlan(cfg)
+
+        val trace = logBegin(req, model = model)
+        if (plan.isEmpty()) {
+            logFinish(trace, 400, errorCode = "no_token", message = "未配置 Qwen token")
+            noCredentialError(res)
+            return
+        }
+
+        // 非流式的换账号比流式干净得多：**一个字节都还没写给调用方**，
+        // 因此任何可切换类失败都能换号重来，不存在"半截内容"的顾虑。
+        var attempts = 0
+        var switches = 0
+        var lastErr: QwenException? = null
+        var result: com.qwen2api.tx.core.ChatResult? = null
+        var usedRoute: CredentialRoute? = null
+
+        var ci = 0
+        while (ci < plan.size) {
+            val route = plan[ci]
+            val hasNext = ci < plan.size - 1
+            val client = newClient(cfg).also { it.credentialOverride = route.credential }
+            attempts++
+            // 无论成败都记录"本轮实际尝试的账号"：失败日志必须归因到真正失败的那个，
+            // 而不是 null（否则 UI/导出会回退成"默认账号"，误导用户去换默认 token）。
+            usedRoute = route
+            // 在**发请求前**记"用过"：失败同样消耗了账号的可用性（对风控而言），
+            // 若只在成功时记，同一个坏账号会因 lastUsedAt 永远最旧而被反复优先选中。
+            noteRouteUsed(route)
+            trace.line("轮次 ${ci + 1}/${plan.size}: 使用 ${route.label}" +
+                (if (route.cooling) "（冷却中，其余候选均不可用）" else ""))
+            try {
+                result = withContext(Dispatchers.IO) {
+                    val files = AttachmentResolver.resolveSuspend(client, prepared, fileStore)
+                    client.chatStream(model, prepared, thinking, files, null)
+                }
+                noteRouteOk(route)
+                break
+            } catch (e: Exception) {
+                val err = AttachmentResolver.humanize(e, emptyList())
+                lastErr = err
+                val switchable = hasNext && accountRouter.shouldSwitch(err)
+                noteRouteFail(route, err, switchable)
+                trace.line("账号 ${route.label} 失败: [${err.code}] ${err.message}")
+                debugLog("nonstream account=${route.label} failed code=${err.code} switchable=$switchable")
+                if (!switchable) break
+                switches++
+                logRoute("${route.label} 失败(${err.code}) → 切换到下一个账号")
+                // 换号前留一点喘息，理由同流式分支：短时间连续打多个账号更像自动化
+                kotlinx.coroutines.delay(SWITCH_PAUSE_MS)
+                ci++
+            }
+        }
+
+        val r = result
+        if (r == null) {
+            val err = lastErr ?: QwenException("UPSTREAM_ERROR", "上游调用失败", 502)
+            logReqTrack(
+                req, err.status, System.currentTimeMillis() - t1, "[${err.code}]",
+                usedRoute, attempts, switches, model,
+            )
+            logFinish(trace, err.status, usedRoute, attempts, switches, err.code, err.message)
+            return sendError(res, err)
+        }
+
+        // 解析模型输出里的工具调用（若有），并把调用块从正文中剥离
+        val parsed = if (toolCtx.enabled) {
+            val p = com.qwen2api.tx.core.ToolPrompt.parse(r.answer)
+            ToolInjector.filterValid(p.calls, toolCtx) to p.remainingText
+        } else {
+            emptyList<com.qwen2api.tx.core.ToolPrompt.ParsedCall>() to r.answer
+        }
+        val toolCalls = parsed.first
+        val answerText = parsed.second
+
+        val msg = JSONObject().put("role", "assistant").put("content", answerText)
+        if (r.thinking.isNotEmpty()) msg.put("reasoning_content", r.thinking)
+
+        val finishReason: String
+        if (toolCalls.isNotEmpty()) {
+            msg.put("tool_calls", ToolInjector.toToolCalls(toolCalls))
+            // 若模型没有输出正文，补一句说明 —— 见流式分支里的同款处理。
+            // 这保证「不解析 tool_calls 的客户端」也能看到可见反馈。
+            if (answerText.isBlank()) {
+                msg.put("content", buildToolCallNotice(toolCalls))
+            }
+            finishReason = "tool_calls"
+        } else {
+            finishReason = "stop"
+        }
+
+        logReqTrack(
+            req, 200, System.currentTimeMillis() - t1, "${answerText.length}ch",
+            usedRoute, attempts, switches, model,
+        )
+        logFinish(trace, 200, usedRoute, attempts, switches, summary = "${answerText.length}ch")
+        sendJson(
+            res, 200,
+            linkedMapOf(
+                "id" to ("chatcmpl-" + Util.uuid().replace("-", "").take(24)),
+                "object" to "chat.completion",
+                "created" to Util.nowSec(),
+                "model" to r.model,
+                "system_fingerprint" to ("qwen2api-tx/" + GatewayConfig.VERSION),
+                "choices" to listOf(
+                    linkedMapOf(
+                        "index" to 0,
+                        "message" to Json.toMap(msg),
+                        "finish_reason" to finishReason,
+                    ),
+                ),
+                "usage" to usageOf(r.usage),
+            ),
+        )
+    }
+
     private suspend fun streamChat(req: HttpRequest, res: HttpResponse, cfg: GatewayConfig, body: JSONObject) {
         val t0 = System.currentTimeMillis()
-        val client = newClient(cfg)
         val messages = parseMessages(body)
         if (messages.isEmpty()) {
             return sendJson(
@@ -1186,26 +1570,37 @@ class GatewayRouter(
                 " msgs=" + messages.size + " roles=" + messages.map { it.role },
         )
 
-        // 附件解析/上传必须在 SSE 响应头之前完成 —— 失败时才能直接返回 JSON 错误
-        var files: List<JSONObject> = emptyList()
-        try {
-            files = withContext(Dispatchers.IO) {
-                AttachmentResolver.resolveSuspend(client, messages, fileStore)
-            }
-        } catch (e: Exception) {
-            val err = AttachmentResolver.humanize(e, files)
-            logReq(req, err.status, System.currentTimeMillis() - t0, "[${err.code}]")
-            return sendError(res, err)
-        }
+        // 提示词注入只做一次：它**原地改写** messages（追加工具说明、合并 system），
+        // 若在账号切换的每一轮里重跑，同一份说明会被反复追加，上下文越来越长。
+        val prepared = messages
+
+        // 对话链路用 chatCredentialPlan：无凭证时仍建立 SSE 再回错误帧，
+        // 与改动前一致（客户端拿到的必须是可解析的 SSE，而不是一段 JSON）。
+        val plan = chatCredentialPlan(cfg)
+
+        // 多账号路由的"可切换"边界（决定了哪些失败能换号）：
+        //  - 只有**还没往客户端写过一个字节**时才能换号。一旦下发过 thinking/content，
+        //    客户端已在累积内容，换号重发会让它看到两段拼接的回复 —— 比直接报错更糟；
+        //  - 因此这里把「按账号尝试」做成外层循环，把「工具格式跑偏重试」留在内层。
+        // 代价说明：工具注入模式下正文是先缓冲的（等剥完调用块才下发），
+        // 所以那一轮里换号是安全的；但思维链是**实时下发**的，它一发就锁住重试/换号。
+        var contentEmitted = false
+        var clientGone = false
+        var answerLen = 0
+        var attempts = 0
+        var switches = 0
+        var lastErr: QwenException? = null
+        var lastRoute: CredentialRoute? = null
+
+        // 日志句柄必须在**写响应头之前**建立：流式链路一旦写出 200 + SSE 头，
+        // 后面任何失败都只能以错误帧收尾，此时若才发现"没有日志句柄"，
+        // 这条失败的请求就永远进不了日志 —— 而失败恰恰是这份日志存在的理由。
+        val trace = logBegin(req, model = model)
 
         res.header("Content-Type", "text/event-stream; charset=utf-8")
         res.header("Cache-Control", "no-cache")
         res.header("X-Accel-Buffering", "no")
         res.writeHead(200)
-
-        // 客户端是否已断开。一旦置位就停止一切写入与重试，
-        // 避免向已关闭的 socket 反复写入导致异常。
-        var clientGone = false
 
         fun send(delta: Map<String, Any?>, fr: String?, u: Map<String, Any?>?) {
             // 客户端可能因超时提前断开（尤其重试会让耗时翻倍）。
@@ -1218,9 +1613,8 @@ class GatewayRouter(
             }
         }
 
-        // 若请求未指定 model 且配置了默认模型，仍使用 defaultModel
+        // 首帧：让客户端立刻知道流已建立（role 分片，OpenAI 流式约定）
         send(mapOf("role" to "assistant", "content" to ""), null, null)
-        var answerLen = 0
 
         // ---------------------------------------------------------------
         // 上游存在概率性「不按格式输出工具调用」的问题（实测约 1/3 失败）。
@@ -1233,264 +1627,231 @@ class GatewayRouter(
         // 避免把失败轮的半截文本泄漏给用户。
         // ---------------------------------------------------------------
         val maxAttempts = if (toolCtx.enabled) 2 else 1
-        var finalValid: List<ToolPrompt.ParsedCall> = emptyList()
-        var finalText = ""
-        var finalUsage: Map<String, Any?>? = null
 
-        // 是否已向客户端推送过内容（thinking/content）。
-        // 参考 qwenstudiopp：一旦推过就不再重试，避免重复输出与半截内容。
-        var contentEmitted = false
+        var ci = 0
+        while (ci < plan.size && !clientGone) {
+            val route = plan[ci]
+            val hasNext = ci < plan.size - 1
+            val client = newClient(cfg).also { it.credentialOverride = route.credential }
+            // 无论成败都记录"本轮实际尝试的账号"：失败日志必须归因到真正失败的那个。
+            lastRoute = route
+            // 在**发请求前**记"用过"：失败同样消耗了账号的可用性（对风控而言），
+            // 若只在成功时记，同一个坏账号会被反复优先选中（它的 lastUsedAt 永远最旧）。
+            noteRouteUsed(route)
+            logRoute("轮次 ${ci + 1}/${plan.size}: 使用 ${route.label}" +
+                (if (route.cooling) "（冷却中，其余候选均不可用）" else ""))
+            trace.line("轮次 ${ci + 1}/${plan.size}: 使用 ${route.label}" +
+                (if (route.cooling) "（冷却中，其余候选均不可用）" else ""))
 
-        var attempt = 0
-        while (attempt < maxAttempts) {
-            attempt++
-            val isLastAttempt = attempt >= maxAttempts
-            val buffer = if (toolCtx.enabled) com.qwen2api.tx.core.ToolCallStreamBuffer() else null
-            val textCollector = StringBuilder()
-            var usage: Map<String, Any?>? = null
-            // 本轮是否已把内容推给客户端（决定本轮失败能否重试）
-            var emittedThisRound = false
+            try {
+                // 附件解析/上传在**每轮各自**做：文件的可见性与凭证绑定
+                //（不同账号上传得到的文件 id 不通用），因此不能跨账号复用。
+                val files = withContext(Dispatchers.IO) {
+                    AttachmentResolver.resolveSuspend(client, prepared, fileStore)
+                }
 
-            // 重试轮的上游异常单独捕获：失败轮可以重试，
-            // 若直接抛出会穿透到外层变成 502，并可能造成响应重复写入。
-            val result = try {
-                client.chatStream(model, messages, thinking, files) { evt ->
-                    when (evt) {
-                        is QwenEvent.Thinking -> {
-                            // 思维链实时下发（让用户看到「正在思考」，避免空白体验）。
-                            // 注意：一旦下发就置 contentEmitted，本轮失败将不再重试。
-                            if (!clientGone) {
-                                send(mapOf("reasoning_content" to evt.delta), null, null)
-                                emittedThisRound = true
-                                contentEmitted = true
+                var attempt = 0
+                var valid: List<ToolPrompt.ParsedCall> = emptyList()
+                var text = ""
+                var usage: Map<String, Any?>? = null
+
+                while (attempt < maxAttempts) {
+                    attempt++
+                    val isLastAttempt = attempt >= maxAttempts
+                    val buffer = if (toolCtx.enabled) com.qwen2api.tx.core.ToolCallStreamBuffer() else null
+                    val textCollector = StringBuilder()
+
+                    val result = try {
+                        client.chatStream(model, prepared, thinking, files) { evt ->
+                            when (evt) {
+                                is QwenEvent.Thinking -> {
+                                    // 思维链实时下发（让用户看到「正在思考」，避免空白体验）。
+                                    // 注意：一旦下发就置 contentEmitted，本轮失败将不再重试/换号。
+                                    if (!clientGone) {
+                                        send(mapOf("reasoning_content" to evt.delta), null, null)
+                                        contentEmitted = true
+                                    }
+                                }
+                                is QwenEvent.Content -> {
+                                    val out = buffer?.feed(evt.delta) ?: evt.delta
+                                    textCollector.append(out)
+                                    // 工具注入模式下正文先缓冲（可能是待剥离的调用块），
+                                    // 因此只有非工具模式才即时下发并锁定重试。
+                                    if (buffer == null && out.isNotEmpty() && !clientGone) {
+                                        send(mapOf("content" to out), null, null)
+                                        contentEmitted = true
+                                    }
+                                }
+                                else -> Unit
                             }
                         }
-                        is QwenEvent.Content -> {
-                            val out = buffer?.feed(evt.delta) ?: evt.delta
-                            textCollector.append(out)
-                            // 工具注入模式下正文先缓冲（可能是待剥离的调用块），
-                            // 因此只有非工具模式才即时下发并锁定重试。
-                            if (buffer == null && out.isNotEmpty() && !clientGone) {
-                                send(mapOf("content" to out), null, null)
-                                emittedThisRound = true
-                                contentEmitted = true
-                            }
+                    } catch (e: Exception) {
+                        val err = if (e is QwenException) e else {
+                            val (c, m, st) = Util.normalizeError(e); QwenException(c, m, st)
                         }
-                        else -> Unit
+                        attempts++
+                        lastErr = err
+                        debugLog("stream attempt=$attempt account=${route.label} error: ${err.code} ${err.message}")
+                        // 已吐过内容：换号会让客户端看到拼接的回复，重试同理，只能如实报错
+                        if (contentEmitted) throw err
+                        val risk = isRiskControlBlock(err.code, err.message)
+                        debugLog("stream attempt=$attempt riskControl=$risk")
+                        // 单凭证（或已是最后一个候选）时保留原有的「冷却阶梯重试」行为：
+                        // 多账号场景下原地等待是纯损失（等待时间应当花在下一个账号上）。
+                        if (risk && !hasNext && !isLastAttempt) {
+                            val waitMs = THROTTLE_WAIT_STEPS_MS[
+                                attempt.coerceAtMost(THROTTLE_WAIT_STEPS_MS.size - 1),
+                            ]
+                            debugLog("stream throttle wait ${waitMs}ms then retry (${attempt + 1}/$maxAttempts)")
+                            // 等待期间发 SSE 注释行保活，避免客户端超时断连
+                            keepAlive(res, waitMs) { clientGone }
+                            if (clientGone) throw err
+                            continue
+                        }
+                        // 非最后一轮且未吐内容：静默重试一次（应对模型格式跑偏）
+                        if (!isLastAttempt) continue
+                        throw err
+                    }
+
+                    val tail = buffer?.flushRemaining().orEmpty()
+                    textCollector.append(tail)
+                    if (buffer == null && textCollector.isEmpty() && result.answer.isNotEmpty()) {
+                        textCollector.append(result.answer)
+                    }
+                    usage = usageOf(result.usage)
+                    text = textCollector.toString()
+                    valid = ToolInjector.filterValid(buffer?.calls.orEmpty(), toolCtx)
+
+                    debugLog(
+                        "stream attempt=$attempt/$maxAttempts parsed=${buffer?.calls?.size ?: 0} " +
+                            "valid=${valid.size} textLen=${text.length} calls=${valid.map { it.name }}",
+                    )
+
+                    if (valid.isNotEmpty()) break
+                    // 没注入工具，或模型确实无需工具（正常回答），都不重试
+                    if (!toolCtx.enabled) break
+                    // 启发式判断：正文里若出现「工具/调用/tool_call」等字样，
+                    // 说明模型想调工具但格式跑偏了，值得重试一次
+                    val looksLikeMissedCall = ToolPrompt.looksLikeMissedToolCall(text)
+                    debugLog("stream attempt=$attempt missedCall=$looksLikeMissedCall")
+                    if (!looksLikeMissedCall) break
+                    // 客户端已断开则不再重试（否则白白多打一次上游）
+                    if (clientGone) break
+                    if (attempt < maxAttempts) {
+                        debugLog("stream retrying (attempt ${attempt + 1})")
                     }
                 }
+
+                // 走到这里本账号轮次成功（无论模型是否调了工具）。
+                noteRouteOk(route)
+                if (!clientGone) {
+                    if (text.isNotEmpty()) {
+                        answerLen += text.length
+                        send(mapOf("content" to text), null, null)
+                    }
+                    if (valid.isNotEmpty()) {
+                        // 关键：即使客户端不处理 tool_calls，也要让用户看到反馈。
+                        // 有些客户端（如部分内置 Agent）不解析 tool_calls，
+                        // 若此时 content 为空，用户会看到「消息发出去了但没有任何回应」。
+                        // 因此这里补一句自然语言说明，既不违反 OpenAI 规范，
+                        // 又保证任何客户端都有可见输出。
+                        if (answerLen == 0) {
+                            send(mapOf("content" to buildToolCallNotice(valid)), null, null)
+                            answerLen += 1
+                        }
+                        // 转成标准 tool_calls 分片：先发 id/name/空 arguments，再分段发 arguments，
+                        // 这样既符合 OpenAI 协议，也让增量客户端能正常累积。
+                        valid.forEachIndexed { idx, call ->
+                            val toolCallsDelta = JSONArray().put(
+                                JSONObject()
+                                    .put("index", idx)
+                                    .put("id", com.qwen2api.tx.core.ToolPrompt.newToolCallId())
+                                    .put("type", "function")
+                                    .put("function", JSONObject().put("name", call.name).put("arguments", "")),
+                            )
+                            send(mapOf("tool_calls" to toolCallsDelta), null, null)
+                            // arguments 分片下发（按 256 字符切，模拟真实续传节奏）
+                            val args = call.argumentsJson
+                            var p = 0
+                            while (p < args.length) {
+                                val e2 = minOf(p + 256, args.length)
+                                val piece = args.substring(p, e2)
+                                val d = JSONArray().put(
+                                    JSONObject()
+                                        .put("index", idx)
+                                        .put("function", JSONObject().put("arguments", piece)),
+                                )
+                                send(mapOf("tool_calls" to d), null, null)
+                                p = e2
+                            }
+                        }
+                        send(emptyMap(), "tool_calls", usage)
+                    } else {
+                        send(emptyMap(), "stop", usage)
+                    }
+                }
+                res.writeChunk("data: [DONE]\n\n")
+                res.end()
+                logReqTrack(
+                    req, 200, System.currentTimeMillis() - t0, "${answerLen}ch",
+                    route, attempts, switches, model,
+                )
+                logFinish(trace, 200, route, attempts, switches, summary = "${answerLen}ch")
+                return
             } catch (e: Exception) {
-                debugLog("stream attempt=$attempt upstream error: ${e.message}")
-                val risk = isRiskControlBlock(e.message)
-                debugLog("stream attempt=$attempt riskControl=$risk emitted=$emittedThisRound")
-                // 风控类错误：递增等待后重试（不再立即重试，否则加剧封禁）
-                if (risk && !contentEmitted && !isLastAttempt) {
-                    val waitMs = THROTTLE_WAIT_STEPS_MS[
-                        attempt.coerceAtMost(THROTTLE_WAIT_STEPS_MS.size - 1),
-                    ]
-                    debugLog("stream throttle wait ${waitMs}ms then retry (${attempt + 1}/$maxAttempts)")
-                    // 等待期间发 SSE 注释行保活，避免客户端超时断连
-                    keepAlive(res, waitMs) { clientGone }
-                    if (clientGone) throw e
+                val err = if (e is QwenException) e else {
+                    val (c, m, st) = Util.normalizeError(e); QwenException(c, m, st)
+                }
+                lastErr = err
+                val switchable = !contentEmitted && hasNext && accountRouter.shouldSwitch(err)
+                noteRouteFail(route, err, switchable)
+                trace.line("账号 ${route.label} 失败: [${err.code}] ${err.message}" +
+                    if (contentEmitted) "（已下发内容，无法换号）" else "")
+                debugLog("stream account=${route.label} failed code=${err.code} switchable=$switchable hasNext=$hasNext")
+                if (switchable) {
+                    switches++
+                    logRoute("${route.label} 失败(${err.code}) → 切换到下一个账号")
+                    // 换号前留一点喘息：同一台设备/出口 IP 在极短时间内连续打多个账号，
+                    // 对上游风控而言分辨率更低（看起来更像自动化）。
+                    kotlinx.coroutines.delay(SWITCH_PAUSE_MS)
+                    ci++
                     continue
                 }
-                // 非最后一轮且未吐内容：静默重试一次（应对模型格式跑偏）
-                if (!isLastAttempt && !contentEmitted) continue
-                throw e
-            }
-            val tail = buffer?.flushRemaining().orEmpty()
-            textCollector.append(tail)
-            if (buffer == null && textCollector.isEmpty() && result.answer.isNotEmpty()) {
-                textCollector.append(result.answer)
-            }
-            usage = usageOf(result.usage)
-
-            val parsed = buffer?.calls.orEmpty()
-            val valid = ToolInjector.filterValid(parsed, toolCtx)
-
-            debugLog(
-                "stream attempt=$attempt/${maxAttempts} parsed=${parsed.size} " +
-                    "valid=${valid.size} textLen=${textCollector.length} calls=${valid.map { it.name }}",
-            )
-
-            finalValid = valid
-            finalText = textCollector.toString()
-            finalUsage = usage
-
-            if (valid.isNotEmpty()) break
-            // 没注入工具，或模型确实无需工具（正常回答），都不重试
-            if (!toolCtx.enabled) break
-            // 启发式判断：正文里若出现「工具/调用/tool_call」等字样，
-            // 说明模型想调工具但格式跑偏了，值得重试一次
-            val looksLikeMissedCall = ToolPrompt.looksLikeMissedToolCall(finalText)
-            debugLog("stream attempt=$attempt missedCall=$looksLikeMissedCall")
-            if (!looksLikeMissedCall) break
-            // 客户端已断开则不再重试（否则白白多打一次上游）
-            if (clientGone) {
-                debugLog("stream attempt=$attempt client gone, stop retry")
                 break
             }
-            if (attempt < maxAttempts) {
-                debugLog("stream retrying (attempt ${attempt + 1})")
-            }
         }
 
-        try {
-            // 最终轮的结果写回客户端
-            if (finalText.isNotEmpty()) {
-                answerLen += finalText.length
-                send(mapOf("content" to finalText), null, null)
-            }
-            val valid = finalValid
-            if (valid.isNotEmpty()) {
-                // 关键：即使客户端不处理 tool_calls，也要让用户看到反馈。
-                // 有些客户端（如部分内置 Agent）不解析 tool_calls，
-                // 若此时 content 为空，用户会看到「消息发出去了但没有任何回应」。
-                // 因此这里补一句自然语言说明，既不违反 OpenAI 规范，
-                // 又保证任何客户端都有可见输出。
-                if (answerLen == 0) {
-                    send(mapOf("content" to buildToolCallNotice(valid)), null, null)
-                    answerLen += 1
-                }
-                // 转成标准 tool_calls 分片：先发 id/name/空 arguments，再分段发 arguments，
-                // 这样既符合 OpenAI 协议，也让增量客户端能正常累积。
-                valid.forEachIndexed { idx, call ->
-                    val toolCallsDelta = JSONArray().put(
-                        JSONObject()
-                            .put("index", idx)
-                            .put("id", com.qwen2api.tx.core.ToolPrompt.newToolCallId())
-                            .put("type", "function")
-                            .put("function", JSONObject().put("name", call.name).put("arguments", "")),
-                    )
-                    send(mapOf("tool_calls" to toolCallsDelta), null, null)
-                    // arguments 分片下发（按 256 字符切，模拟真实续传节奏）
-                    val args = call.argumentsJson
-                    var p = 0
-                    while (p < args.length) {
-                        val end = minOf(p + 256, args.length)
-                        val piece = args.substring(p, end)
-                        val d = JSONArray().put(
+        // 所有候选都失败，或客户端断开：如实把错误回报给客户端。
+        val err = lastErr ?: QwenException(
+            if (clientGone) "CLIENT_GONE" else "UPSTREAM_ERROR",
+            if (clientGone) "客户端已断开连接" else "上游调用失败",
+            502,
+        )
+        val safe = AttachmentResolver.humanize(err, emptyList())
+        if (!clientGone) {
+            try {
+                res.writeChunk(
+                    "data: " + JSONObject()
+                        .put(
+                            "error",
                             JSONObject()
-                                .put("index", idx)
-                                .put("function", JSONObject().put("arguments", piece)),
-                        )
-                        send(mapOf("tool_calls" to d), null, null)
-                        p = end
-                    }
-                }
-                send(emptyMap(), "tool_calls", finalUsage)
-            } else {
-                send(emptyMap(), "stop", finalUsage)
+                                .put("message", safe.message)
+                                .put("type", "api_error")
+                                .put("code", safe.code)
+                                .put("status", safe.status),
+                        ) + "\n\n",
+                )
+                res.writeChunk("data: [DONE]\n\n")
+            } catch (e: Exception) {
+                // 连接已断：不再尝试写入
             }
-        } catch (e: Exception) {
-            val err = AttachmentResolver.humanize(e, files)
-            res.writeChunk(
-                "data: " + JSONObject()
-                    .put(
-                        "error",
-                        JSONObject()
-                            .put("message", err.message)
-                            .put("type", "api_error")
-                            .put("code", err.code)
-                            .put("status", err.status),
-                    ) + "\n\n",
-            )
-            res.writeChunk("data: [DONE]\n\n")
-            res.end()
-            logReq(req, err.status, System.currentTimeMillis() - t0, "[${err.code}]")
-            return
         }
-        res.writeChunk("data: [DONE]\n\n")
         res.end()
-        logReq(req, 200, System.currentTimeMillis() - t0, "${answerLen}ch")
-    }
-
-    private suspend fun nonStreamChat(req: HttpRequest, res: HttpResponse, cfg: GatewayConfig, body: JSONObject) {
-        val t1 = System.currentTimeMillis()
-        val client = newClient(cfg)
-        val messages = parseMessages(body)
-        if (messages.isEmpty()) {
-            return sendJson(
-                res, 400,
-                mapOf(
-                    "error" to mapOf(
-                        "message" to "messages is required",
-                        "type" to "invalid_request_error",
-                        "code" to "bad_request",
-                    ),
-                ),
-            )
-        }
-        val model = Json.str(body, "model").ifEmpty { cfg.defaultModel }
-        val thinking = if (body.has("thinking")) Json.bool(body, "thinking", true) else cfg.thinking
-
-        // 方案 B：非流式下先把工具定义注入成提示词
-        // 顺序同 streamChat：全局 System Prompt 先注入（只碰 system 角色），
-        // 再由 ToolInjector 追加工具说明到最后一条 user 消息末尾。
-        val sysCtx = SystemPromptInjector.prepare(messages, cfg)
-        val toolCtx = ToolInjector.prepare(messages, body)
-        debugLog(
-            "nonstream req: model=$model tools=" + (body.optJSONArray("tools")?.length() ?: 0) +
-                " sysPrompt=" + sysCtx.applied + "/" + sysCtx.mode,
+        logReqTrack(
+            req, safe.status, System.currentTimeMillis() - t0, "[${safe.code}]",
+            lastRoute, attempts, switches, model,
         )
-
-        var files: List<JSONObject> = emptyList()
-        val result = try {
-            withContext(Dispatchers.IO) {
-                files = AttachmentResolver.resolveSuspend(client, messages, fileStore)
-                client.chatStream(model, messages, thinking, files, null)
-            }
-        } catch (e: Exception) {
-            val err = AttachmentResolver.humanize(e, files)
-            logReq(req, err.status, System.currentTimeMillis() - t1, "[${err.code}]")
-            return sendError(res, err)
-        }
-
-        // 解析模型输出里的工具调用（若有），并把调用块从正文中剥离
-        val parsed = if (toolCtx.enabled) {
-            val p = com.qwen2api.tx.core.ToolPrompt.parse(result.answer)
-            ToolInjector.filterValid(p.calls, toolCtx) to p.remainingText
-        } else {
-            emptyList<com.qwen2api.tx.core.ToolPrompt.ParsedCall>() to result.answer
-        }
-        val toolCalls = parsed.first
-        val answerText = parsed.second
-
-        val msg = JSONObject().put("role", "assistant").put("content", answerText)
-        if (result.thinking.isNotEmpty()) msg.put("reasoning_content", result.thinking)
-
-        val finishReason: String
-        if (toolCalls.isNotEmpty()) {
-            msg.put("tool_calls", ToolInjector.toToolCalls(toolCalls))
-            // 若模型没有输出正文，补一句说明 —— 见流式分支里的同款处理。
-            // 这保证「不解析 tool_calls 的客户端」也能看到可见反馈。
-            if (answerText.isBlank()) {
-                msg.put("content", buildToolCallNotice(toolCalls))
-            }
-            finishReason = "tool_calls"
-        } else {
-            finishReason = "stop"
-        }
-
-        logReq(req, 200, System.currentTimeMillis() - t1, "${answerText.length}ch")
-        sendJson(
-            res, 200,
-            linkedMapOf(
-                "id" to ("chatcmpl-" + Util.uuid().replace("-", "").take(24)),
-                "object" to "chat.completion",
-                "created" to Util.nowSec(),
-                "model" to result.model,
-                "system_fingerprint" to ("qwen2api-tx/" + GatewayConfig.VERSION),
-                "choices" to listOf(
-                    linkedMapOf(
-                        "index" to 0,
-                        "message" to Json.toMap(msg),
-                        "finish_reason" to finishReason,
-                    ),
-                ),
-                "usage" to usageOf(result.usage),
-            ),
-        )
+        logFinish(trace, safe.status, lastRoute, attempts, switches, safe.code, safe.message)
     }
 
     // ---------------- /v1/files ----------------
@@ -1499,17 +1860,9 @@ class GatewayRouter(
         GatewayState.reqCount++
         if (!checkAuth(req, cfg)) return apiKeyError(res)
         val fresh = configRepo.load()
-        if (fresh.qwenToken.isBlank()) {
-            return sendJson(
-                res, 400,
-                mapOf(
-                    "error" to mapOf(
-                        "message" to "请先在应用内配置 Qwen token",
-                        "type" to "invalid_request_error",
-                        "code" to "no_token",
-                    ),
-                ),
-            )
+        if (credentialPlan(fresh).isEmpty()) {
+            noCredentialError(res)
+            return
         }
         val parts = MultipartParser.parse(req.body, req.header("content-type"))
             ?: return sendJson(
@@ -1539,7 +1892,6 @@ class GatewayRouter(
         val purpose = parts.firstOrNull { it.name == "purpose" }
             ?.data?.toString(Charsets.UTF_8)?.take(60) ?: "assistants"
 
-        val client = newClient(fresh)
         val guessedKind = QwenClient.mimeToKind(filePart.contentType, filePart.filename)
         val contentType = filePart.contentType.ifEmpty {
             when (guessedKind) {
@@ -1549,33 +1901,70 @@ class GatewayRouter(
                 else -> "application/octet-stream"
             }
         }
-        return try {
-            val t0 = System.currentTimeMillis()
-            val up = withContext(Dispatchers.IO) {
-                client.uploadFile(filePart.data, filePart.filename, contentType)
-            }
-            val rec = FileRecord(
-                id = "file-" + Util.randomBase64Url(12),
-                qwenId = up.id,
-                url = up.url,
-                filename = up.name,
-                bytes = up.size,
-                mime = up.mime,
-                kind = up.kind.name.lowercase(),
-                createdAt = Util.nowSec(),
-                purpose = purpose,
-                entry = up.entry,
-            )
-            fileStore.add(rec)
-            logReq(req, 200, System.currentTimeMillis() - t0, "${rec.kind} ${"%.1f".format(up.size / 1024.0)}KB")
-            sendJson(res, 200, Json.toMap(rec.toOpenAi()))
-        } catch (e: Exception) {
-            val err = if (e is QwenException) e else {
-                val (c, m, s) = Util.normalizeError(e); QwenException(c, m, s)
-            }
-            logReq(req, err.status, 0, "[${err.code}]")
-            sendError(res, err)
+        val plan = credentialPlan(fresh)
+        if (plan.isEmpty()) {
+            noCredentialError(res)
+            return
         }
+        val trace = logBegin(req)
+        var attempts = 0
+        var switches = 0
+        var lastErr: QwenException? = null
+        var lastRoute: CredentialRoute? = null
+        var ci = 0
+        // 上传同样是"一个字节都还没回给调用方"，因此可换账号。
+        // 换账号后 file_id 会变（文件属于上传它的那个账号），所以必须重新上传 ——
+        // 不能把上一次失败的 qwenId 拿来用，那样调用方后续引用会命中"文件不存在"。
+        while (ci < plan.size) {
+            val route = plan[ci]
+            val hasNext = ci < plan.size - 1
+            attempts++
+            lastRoute = route
+            val client = newClient(fresh).also { it.credentialOverride = route.credential }
+            try {
+                val t0 = System.currentTimeMillis()
+                val up = withContext(Dispatchers.IO) {
+                    client.uploadFile(filePart.data, filePart.filename, contentType)
+                }
+                val rec = FileRecord(
+                    id = "file-" + Util.randomBase64Url(12),
+                    qwenId = up.id,
+                    url = up.url,
+                    filename = up.name,
+                    bytes = up.size,
+                    mime = up.mime,
+                    kind = up.kind.name.lowercase(),
+                    createdAt = Util.nowSec(),
+                    purpose = purpose,
+                    entry = up.entry,
+                )
+                fileStore.add(rec)
+                noteRouteOk(route)
+                logReqTrack(
+                    req, 200, System.currentTimeMillis() - t0,
+                    "${rec.kind} ${"%.1f".format(up.size / 1024.0)}KB", route, attempts, switches,
+                )
+                logFinish(trace, 200, route, attempts, switches, summary = "${rec.kind} ${up.size}B")
+                return sendJson(res, 200, Json.toMap(rec.toOpenAi()))
+            } catch (e: Exception) {
+                val err = if (e is QwenException) e else {
+                    val (c, m, s) = Util.normalizeError(e); QwenException(c, m, s)
+                }
+                lastErr = err
+                val switchable = hasNext && accountRouter.shouldSwitch(err)
+                noteRouteFail(route, err, switchable)
+                trace.line("账号 ${route.label} 上传失败: [${err.code}] ${err.message}")
+                if (!switchable) break
+                switches++
+                logRoute("${route.label} 上传失败(${err.code}) → 切换到下一个账号")
+                kotlinx.coroutines.delay(SWITCH_PAUSE_MS)
+                ci++
+            }
+        }
+        val err = lastErr ?: QwenException("UPSTREAM_ERROR", "上传失败", 502)
+        logReqTrack(req, err.status, 0, "[${err.code}]", lastRoute, attempts, switches)
+        logFinish(trace, err.status, lastRoute, attempts, switches, err.code, err.message)
+        sendError(res, err)
     }
 
     private fun handleFileList(req: HttpRequest, res: HttpResponse, cfg: GatewayConfig) {
@@ -1706,6 +2095,32 @@ class GatewayRouter(
                         "qwenCheckAt" to GatewayState.qwenCheckAt,
                         "models" to models.map { linkedMapOf("id" to it.id, "name" to it.name) },
                         "reqCount" to GatewayState.reqCount,
+                        // ---- 多账号路由 ----
+                        // 只回掩码与健康度，**绝不回凭证明文**：本接口免鉴权（仅限本机），
+                        // 常被脚本/浏览器插件轮询，回明文等于凭空多一个泄漏面。
+                        "multiAccount" to cfg.multiAccount,
+                        "accountCooldownMs" to cfg.accountCooldownMs,
+                        "maxAccountSwitches" to cfg.maxAccountSwitches,
+                        "accounts" to accountRouter.snapshot(cfg).map { a ->
+                            linkedMapOf(
+                                "id" to a.accountId,
+                                "label" to a.label,
+                                "enabled" to a.enabled,
+                                "healthy" to a.healthy,
+                                "lastUsedAt" to a.lastUsedAt,
+                                "lastErrorCode" to a.lastErrorCode,
+                                "lastError" to a.lastError,
+                                "cooldownLeftMs" to a.cooldownLeftMs,
+                            )
+                        },
+                        // ---- 调用日志 ----
+                        // 只给统计与最近一条失败，不给全量（全量走 /admin/api/logs 或导出文件）
+                        "logCount" to logStore.count(),
+                        "logTotal" to logStore.totalCount,
+                        "logFailTotal" to logStore.failCount,
+                        "lastFailure" to logStore.lastFailure,
+                        "lastAccountRoute" to GatewayState.lastAccountRoute,
+                        "lastRouteSummary" to GatewayState.lastRouteSummary,
                         // 图片链路最近一条过程日志（重试/payload/源图上传）。
                         // 图片链路的失败原因常常只能在这几行里看出来，
                         // 而手机上看 logcat 并不方便，所以顺手透到状态接口。
@@ -1753,27 +2168,259 @@ class GatewayRouter(
 
             method == "POST" && pathname == "/admin/api/check" -> {
                 val fresh = configRepo.load()
-                if (fresh.qwenToken.isBlank()) {
-                    return sendJson(res, 200, mapOf("ok" to false, "message" to "未配置 token"))
+                val plan = credentialPlan(fresh)
+                if (plan.isEmpty()) {
+                    return sendJson(res, 200, mapOf("ok" to false, "message" to "未配置 token 或账号"))
                 }
-                try {
-                    val models = withContext(Dispatchers.IO) { newClient(fresh).listModels() }
+                // 逐个账号检测并如实汇报。只测"当前选中的那个"会误导：
+                // 用户在多账号下想知道的恰恰是"有哪几个是坏的"。
+                val detail = ArrayList<Map<String, Any?>>()
+                var goodModels: List<com.qwen2api.tx.core.QwenModel>? = null
+                var lastMsg = ""
+                for (route in plan) {
+                    try {
+                        val models = withContext(Dispatchers.IO) {
+                            newClient(fresh)
+                                .also { it.credentialOverride = route.credential }
+                                .listModels()
+                        }
+                        noteRouteOk(route)
+                        if (goodModels == null) goodModels = models
+                        detail.add(
+                            mapOf(
+                                "id" to route.accountId,
+                                "label" to route.label,
+                                "ok" to true,
+                                "models" to models.size,
+                            ),
+                        )
+                    } catch (e: Exception) {
+                        val err = if (e is QwenException) e else {
+                            val (c, m, st) = Util.normalizeError(e); QwenException(c, m, st)
+                        }
+                        lastMsg = err.message
+                        noteRouteFail(route, err, accountRouter.shouldSwitch(err))
+                        detail.add(
+                            mapOf(
+                                "id" to route.accountId,
+                                "label" to route.label,
+                                "ok" to false,
+                                "message" to err.message,
+                            ),
+                        )
+                    }
+                }
+                val models = goodModels
+                if (models != null) {
                     GatewayState.modelsCache = models
+                    GatewayState.modelsCacheAt = System.currentTimeMillis()
                     GatewayState.qwenOk = true
                     GatewayState.qwenCheckAt = System.currentTimeMillis()
+                    val okN = detail.count { it["ok"] == true }
                     sendJson(
                         res, 200,
                         mapOf(
                             "ok" to true,
-                            "message" to "连接正常 (${models.size} 个模型)",
+                            "message" to "连接正常 ($okN/${detail.size} 个账号可用, ${models.size} 个模型)",
                             "models" to models.map { it.id },
+                            "accounts" to detail,
                         ),
                     )
-                } catch (e: Exception) {
+                } else {
                     GatewayState.qwenOk = false
                     GatewayState.qwenCheckAt = System.currentTimeMillis()
-                    sendJson(res, 200, mapOf("ok" to false, "message" to (e.message ?: "检测失败")))
+                    sendJson(
+                        res, 200,
+                        mapOf(
+                            "ok" to false,
+                            "message" to "全部账号不可用: $lastMsg",
+                            "accounts" to detail,
+                        ),
+                    )
                 }
+            }
+
+            // ---------------- 多账号管理 ----------------
+
+            method == "GET" && pathname == "/admin/api/accounts" -> {
+                sendJson(
+                    res, 200,
+                    mapOf(
+                        "ok" to true,
+                        "enabled" to cfg.multiAccount,
+                        "cooldownMs" to cfg.accountCooldownMs,
+                        "maxSwitches" to cfg.maxAccountSwitches,
+                        "defaultTokenMask" to ConfigStore.maskToken(cfg.qwenToken),
+                        "defaultConfigured" to cfg.qwenToken.isNotBlank(),
+                        "accounts" to accountRepo.all().map { a ->
+                            // 凭证只回掩码：这个接口是"看有哪些账号"用的，
+                            // 明文没有任何展示价值，却会在任何一次抓包/日志里永久留下。
+                            linkedMapOf(
+                                "id" to a.id,
+                                "label" to a.displayName(),
+                                "mask" to ConfigStore.maskToken(a.credential),
+                                "type" to ConfigStore.detectTokenType(a.credential),
+                                "enabled" to a.enabled,
+                                "createdAt" to a.createdAt,
+                                "lastUsedAt" to a.lastUsedAt,
+                                "lastErrorCode" to a.lastErrorCode,
+                                "lastError" to a.lastError,
+                                "lastErrorAt" to a.lastErrorAt,
+                            )
+                        },
+                    ),
+                )
+            }
+
+            method == "POST" && pathname == "/admin/api/accounts/add" -> {
+                val san = AccountStore.build(
+                    Json.strOrNull(body, "token").orEmpty(),
+                    Json.strOrNull(body, "label").orEmpty(),
+                )
+                if (!san.ok) return sendJson(res, 400, mapOf("ok" to false, "message" to san.message))
+                // 与既有账号/默认 token 重复时直接拒绝，而不是加进去静默无用：
+                // 凭证重复意味着"切换账号"会切到同一个账号，表现为"换了但还是同样的错误"，
+                // 而用户会以为是路由坏了。
+                val dup = accountRepo.all().firstOrNull { it.credential == san.token }
+                if (dup != null) {
+                    return sendJson(
+                        res, 200,
+                        mapOf("ok" to false, "message" to "该凭证已存在于账号「${dup.displayName()}」，无需重复添加"),
+                    )
+                }
+                if (cfg.qwenToken.isNotBlank() && cfg.qwenToken == san.token) {
+                    return sendJson(
+                        res, 200,
+                        mapOf("ok" to false, "message" to "该凭证就是当前的默认账号，无需重复添加"),
+                    )
+                }
+                val acc = QwenAccount(
+                    id = AccountStore.newId(),
+                    label = Json.strOrNull(body, "label").orEmpty(),
+                    credential = san.token,
+                    enabled = body.optBoolean("enabled", true),
+                    createdAt = System.currentTimeMillis(),
+                )
+                accountRepo.upsert(acc)
+                // 新增即验证：不验证的话，用户要等到真正发请求才知道 token 是坏的，
+                // 而那时错误会混在业务错误里，很难归因到"某个账号配错了"。
+                var verified = false
+                var verifyMsg = ""
+                try {
+                    val models = withContext(Dispatchers.IO) {
+                        QwenClient("", 0).also { it.credentialOverride = acc.credential }.listModels()
+                    }
+                    verified = true
+                    verifyMsg = "验证通过 (${models.size} 个模型)"
+                    accountRouter.noteOk(CredentialRoute(acc.id, acc.displayName(), acc.credential))
+                } catch (e: Exception) {
+                    verifyMsg = "已保存，但验证未通过: ${e.message}"
+                }
+                sendJson(
+                    res, 200,
+                    mapOf(
+                        "ok" to true,
+                        "verified" to verified,
+                        "message" to ("账号已添加。" + verifyMsg + if (san.note.isNotEmpty()) "。${san.note}" else ""),
+                        "account" to mapOf(
+                            "id" to acc.id,
+                            "label" to acc.displayName(),
+                            "mask" to ConfigStore.maskToken(acc.credential),
+                        ),
+                    ),
+                )
+            }
+
+            method == "POST" && pathname == "/admin/api/accounts/update" -> {
+                val id = Json.strOrNull(body, "id").orEmpty()
+                val cur = accountRepo.find(id)
+                    ?: return sendJson(res, 404, mapOf("ok" to false, "message" to "账号不存在: $id"))
+                var next = cur
+                Json.strOrNull(body, "label")?.let { next = next.copy(label = it) }
+                body.opt("enabled")?.let { if (it is Boolean) next = next.copy(enabled = it) }
+                Json.strOrNull(body, "token")?.takeIf { it.isNotBlank() }?.let { raw ->
+                    val san = ConfigStore.sanitizeQwenToken(raw)
+                    if (!san.ok) return sendJson(res, 400, mapOf("ok" to false, "message" to san.message))
+                    next = next.copy(credential = san.token, lastError = "", lastErrorCode = "")
+                }
+                accountRepo.upsert(next)
+                sendJson(res, 200, mapOf("ok" to true, "message" to "已更新", "id" to id))
+            }
+
+            method == "POST" && pathname == "/admin/api/accounts/remove" -> {
+                val id = Json.strOrNull(body, "id").orEmpty()
+                val gone = accountRepo.remove(id)
+                    ?: return sendJson(res, 404, mapOf("ok" to false, "message" to "账号不存在: $id"))
+                sendJson(res, 200, mapOf("ok" to true, "message" to "已删除「${gone.displayName()}」"))
+            }
+
+            method == "POST" && pathname == "/admin/api/accounts/reset" -> {
+                // 用途：用户过完滑块验证后想立刻让账号回到可用状态。
+                // 没有这个动作的话，只能等冷却自然结束（默认 10 分钟）——
+                // 而用户刚刚手工证明了自己能过验证，却被网关继续挡着，体验上说不通。
+                accountRouter.resetHealth()
+                sendJson(res, 200, mapOf("ok" to true, "message" to "已清空全部账号的失败记录与冷却"))
+            }
+
+            // ---------------- 调用日志 ----------------
+
+            method == "GET" && pathname == "/admin/api/logs" -> {
+                // 查询参数走 query（GET 无 body）。limit 必须夹紧：
+                // 日志里带 trace，几千条一次性回给浏览器插件会直接把内存打满。
+                val limit = (req.queryParam("limit")?.toIntOrNull() ?: 100).coerceIn(1, ApiLogStore.MAX_ENTRIES)
+                val onlyFail = req.queryParam("level")?.lowercase() == "fail"
+                val list = logStore.recent(limit).filter { !onlyFail || it.level == ApiLogLevel.FAIL }
+                sendJson(
+                    res, 200,
+                    linkedMapOf(
+                        "ok" to true,
+                        "count" to list.size,
+                        "total" to logStore.totalCount,
+                        "failTotal" to logStore.failCount,
+                        "entries" to list.map { Json.toMap(it.toJson()) },
+                    ),
+                )
+            }
+
+            method == "POST" && pathname == "/admin/api/logs/clear" -> {
+                logStore.clear()
+                sendJson(res, 200, mapOf("ok" to true, "message" to "调用日志已清空"))
+            }
+
+            method == "GET" && pathname == "/admin/api/logs/export" -> {
+                // 导出走 text/markdown 而不是 JSON：这份文件的用途是"发给别人/AI 帮忙定位"，
+                // Markdown 在聊天窗口与 issue 里都能直接读，JSON 反而要对方自己解析。
+                val body = logStore.exportText(
+                    includeTrace = req.queryParam("trace")?.lowercase() != "0",
+                )
+                // 参数取值只允许无歧义的 utf8 / base64：任意取值会让下游脚本收到
+                // 意料之外的编码而无从判断，这类"看起来成功但内容不对"最难查。
+                val enc = req.queryParam("encoding")?.lowercase()
+                if (enc != null && enc != "utf8" && enc != "base64") {
+                    return sendJson(
+                        res, 400,
+                        mapOf("error" to mapOf("message" to "encoding 只支持 utf8 或 base64")),
+                    )
+                }
+                if (enc == "base64") {
+                    val text = body.toByteArray(Charsets.UTF_8)
+                    val b64 = B64.encode(text)
+                    return sendJson(
+                        res, 200,
+                        mapOf(
+                            "ok" to true,
+                            "encoding" to "base64",
+                            "bytes" to text.size,
+                            "content" to b64,
+                        ),
+                    )
+                }
+                val bytes = body.toByteArray(Charsets.UTF_8)
+                res.header("Content-Type", "text/markdown; charset=utf-8")
+                res.header("Content-Disposition", "attachment; filename=\"qwen2api-logs.md\"")
+                res.header("Content-Length", bytes.size.toString())
+                res.writeHead(200)
+                return res.end(bytes)
             }
 
             method == "POST" && pathname == "/admin/api/key/regenerate" -> {
@@ -1893,6 +2540,95 @@ class GatewayRouter(
         debugLog(line)
     }
 
+    // ---------------- 调用日志（可视化 + 导出） ----------------
+
+    /**
+     * 开始记录一次调用。
+     *
+     * 只有**走到 finish** 的请求才会出现在日志里，因此列表里每条都是确定结果。
+     * 注意：这是给"排查与导出"用的旁路，任何写入失败都不应影响请求本身，
+     * 因此所有操作都包了 runCatching。
+     */
+    private fun logBegin(req: HttpRequest, model: String = "", route: CredentialRoute? = null): ApiLogStore.Trace =
+        logStore.begin(
+            method = req.effectiveMethod,
+            path = rawPathOf(req),
+            model = model,
+            accountId = route?.accountId.orEmpty(),
+            accountLabel = relativeLabel(route),
+        )
+
+    /** 结束记录（成功/失败一条通路，避免两处分别构造导致字段漏填） */
+    private fun logFinish(
+        trace: ApiLogStore.Trace?,
+        status: Int,
+        route: CredentialRoute? = null,
+        attempts: Int = 1,
+        switches: Int = 0,
+        errorCode: String = "",
+        message: String = "",
+        summary: String = "",
+    ) {
+        val t = trace ?: return
+        runCatching {
+            route?.let { t.useAccount(it.accountId, relativeLabel(it)) }
+            t.attempts = attempts
+            t.switches = switches
+            if (message.isNotEmpty()) t.line("错误: [$errorCode] $message")
+            t.finish(
+                level = if (status in 200..299) ApiLogLevel.OK else ApiLogLevel.FAIL,
+                status = status,
+                errorCode = errorCode,
+                message = message,
+                summary = summary,
+            )
+        }
+    }
+
+    /**
+     * 与 [logReq] 同款，但额外带上账号与尝试次数。
+     *
+     * 为什么不让 [logReq] 也带这些参数：它被十几处调用（文件、图片、admin），
+     * 大部分链路根本没有"账号轮换"的概念，强行加参数会让那些调用点传一堆默认值。
+     * 这里保留两个入口，各自表达自己的语义。
+     */
+    private fun logReqTrack(
+        req: HttpRequest,
+        status: Int,
+        ms: Long,
+        note: String,
+        route: CredentialRoute?,
+        attempts: Int,
+        switches: Int,
+        model: String = "",
+    ) {
+        val acct = route?.let { " · 账号 ${relativeLabel(it)}" } ?: ""
+        val retry = if (attempts > 1 || switches > 0) " · 上游尝试 $attempts 次/切换 $switches 次" else ""
+        logReq(req, status, ms, note + acct + retry)
+        GatewayState.lastRouteSummary = "HTTP $status · ${ms}ms" + acct + retry
+    }
+
+    /**
+     * 账号在日志里的相对称呼。
+     *
+     * 用"默认账号"而不是"默认"：日志导出后会被贴到 issue 里，
+     * "默认"容易被误读成"默认行为"而不知道指的是凭证。
+     */
+    private fun relativeLabel(route: CredentialRoute?): String = route?.label.orEmpty()
+
+    /** 去掉 query 的路径（日志按路径聚合时不该被 chat_id 之类打散） */
+    private fun rawPathOf(req: HttpRequest): String {
+        val t = req.rawTarget
+        val i = t.indexOf('?')
+        return if (i >= 0) t.substring(0, i) else t
+    }
+
+    /** 写一条账号路由诊断（同时进 trace、logcat 与服务状态） */
+    private fun logRoute(msg: String) {
+        debugLog("ROUTE $msg")
+        GatewayState.lastAccountRoute = msg
+    }
+
     /**
      * 输出诊断日志。
      *
@@ -1973,5 +2709,17 @@ class GatewayRouter(
         const val RISK_CONTROL_HINT =
             "上游触发了安全验证/限流（风控）。这通常因短时间内请求过多导致，并非网关故障。" +
                 "请稍后重试；若持续出现，请在浏览器打开 chat.qwen.ai 手动过一次滑块验证。"
+
+        /**
+         * 换账号前的停顿（毫秒）。
+         *
+         * 不是"退避重试"，而是**切换节奏**：同一台设备、同一个出口 IP 在短短
+         * 几百毫秒内连续打两个不同账号，对上游风控来说分辨率更低 ——
+         * 看起来更像自动化而不是"两个人在不同时间用各自的账号"。
+         *
+         * 取值 600ms：小到不影响用户感知（多账号切换本身是失败路径，
+         * 用户已经在等），大到足以让两次请求落在不同的秒级时间片上。
+         */
+        const val SWITCH_PAUSE_MS = 600L
     }
 }

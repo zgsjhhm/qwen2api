@@ -35,6 +35,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.qwen2api.tx.core.ApiLogEntry
+import com.qwen2api.tx.core.ApiLogLevel
 import com.qwen2api.tx.core.ClipboardUtil
 import com.qwen2api.tx.core.ConfigStore
 import com.qwen2api.tx.core.GatewayConfig
@@ -96,6 +98,7 @@ fun Qwen2ApiApp() {
                         item { SectionTitle("连接与密钥") }
                         item { TokenCard(ui, vm) }
                         item { KeyCard(ui, vm, ctx) }
+                        item { AccountCard(ui, vm, ctx) }
                     }
                     2 -> {   // 测试
                         item { SectionTitle("在线测试") }
@@ -105,6 +108,10 @@ fun Qwen2ApiApp() {
                         item { SectionTitle("接入外部工具") }
                         item { GuideCard(ui, vm, ctx) }
                         item { SettingsCard(ui, vm) }
+                    }
+                    4 -> {   // 日志
+                        item { SectionTitle("调用日志") }
+                        item { LogCard(ui, vm, ctx) }
                     }
                 }
             }
@@ -116,12 +123,13 @@ fun Qwen2ApiApp() {
 
 private data class NavItem(val label: String, val icon: String)
 
-private val NAV_ITEMS = listOf(
-    NavItem("概览", "◎"),
-    NavItem("配置", "⚙"),
-    NavItem("测试", "▶"),
-    NavItem("接入", "⇄"),
-)
+    private val NAV_ITEMS = listOf(
+        NavItem("概览", "◎"),
+        NavItem("配置", "⚙"),
+        NavItem("测试", "▶"),
+        NavItem("接入", "⇄"),
+        NavItem("日志", "≡"),
+    )
 
 /**
  * 底部卡片式导航。
@@ -875,6 +883,41 @@ private fun GuideCard(ui: UiState, vm: MainViewModel, ctx: Context) {
 
 // ---------------- 5. 高级设置 ----------------
 
+/**
+ * 「标签 + 数字输入框」的组合。
+ *
+ * 抽出来是因为高级设置里有 6 处一模一样的结构（端口/间隔/重试/等待/冷却/切换次数），
+ * 每处各写一遍会让"数字过滤 + 位数上限"这类细节在改一处时漏掉另一处 ——
+ * 而漏掉的那处会允许用户输入非数字，保存时静默落回默认值。
+ *
+ * @param maxDigits 位数上限，防止用户把 999999 这类值填进去（上限由保存时的
+ *   coerceIn 兜底，但界面先挡住能少一次"我明明填了却没生效"）
+ */
+@Composable
+private fun LabeledField(
+    label: String,
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    maxDigits: Int = 6,
+) {
+    Column(modifier) {
+        Text(label, color = Dim, fontSize = 12.sp)
+        OutlinedTextField(
+            value = value,
+            onValueChange = { raw -> onValueChange(raw.filter { it.isDigit() }.take(maxDigits)) },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = Txt),
+            shape = RoundedCornerShape(10.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Acc, unfocusedBorderColor = Line,
+                focusedContainerColor = Bg, unfocusedContainerColor = Bg,
+            ),
+        )
+    }
+}
+
 @Composable
 private fun SettingsCard(ui: UiState, vm: MainViewModel) {
     val ctx = LocalContext.current
@@ -897,6 +940,13 @@ private fun SettingsCard(ui: UiState, vm: MainViewModel) {
     }
     var sysPromptReplace by remember(ui.config.systemPromptMode) {
         mutableStateOf(ui.config.systemPromptMode == GatewayConfig.SYSTEM_PROMPT_REPLACE)
+    }
+    var multiAccount by remember(ui.config.multiAccount) { mutableStateOf(ui.config.multiAccount) }
+    var cooldownSec by remember(ui.config.accountCooldownMs) {
+        mutableStateOf((ui.config.accountCooldownMs / 1000).toString())
+    }
+    var maxSwitches by remember(ui.config.maxAccountSwitches) {
+        mutableStateOf(ui.config.maxAccountSwitches.toString())
     }
     // 导入提示：临时文案，明说「本文件为什么没进来」
     var importNote by remember { mutableStateOf<String?>(null) }
@@ -941,66 +991,38 @@ private fun SettingsCard(ui: UiState, vm: MainViewModel) {
 
         Spacer(Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Column(Modifier.weight(1f)) {
-                Text("服务端口", color = Dim, fontSize = 12.sp)
-                OutlinedTextField(
-                    value = port, onValueChange = { port = it.filter { c -> c.isDigit() }.take(5) },
-                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = Txt),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Acc, unfocusedBorderColor = Line,
-                        focusedContainerColor = Bg, unfocusedContainerColor = Bg,
-                    ),
-                )
-            }
-            Column(Modifier.weight(1f)) {
-                Text("请求最小间隔 (ms)", color = Dim, fontSize = 12.sp)
-                OutlinedTextField(
-                    value = throttle, onValueChange = { throttle = it.filter { c -> c.isDigit() }.take(5) },
-                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = Txt),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Acc, unfocusedBorderColor = Line,
-                        focusedContainerColor = Bg, unfocusedContainerColor = Bg,
-                    ),
-                )
-            }
+            LabeledField(
+                label = "服务端口",
+                value = port,
+                onValueChange = { port = it },
+                maxDigits = 5,
+                modifier = Modifier.weight(1f),
+            )
+            LabeledField(
+                label = "请求最小间隔 (ms)",
+                value = throttle,
+                onValueChange = { throttle = it },
+                maxDigits = 5,
+                modifier = Modifier.weight(1f),
+            )
         }
 
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Column(Modifier.weight(1f)) {
-                Text("出图重试次数", color = Dim, fontSize = 12.sp)
-                OutlinedTextField(
-                    value = imgRetry,
-                    onValueChange = { imgRetry = it.filter { c -> c.isDigit() }.take(1) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = Txt),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Acc, unfocusedBorderColor = Line,
-                        focusedContainerColor = Bg, unfocusedContainerColor = Bg,
-                    ),
-                )
-            }
-            Column(Modifier.weight(1f)) {
-                Text("首次重试等待 (ms)", color = Dim, fontSize = 12.sp)
-                OutlinedTextField(
-                    value = imgBackoff,
-                    onValueChange = { imgBackoff = it.filter { c -> c.isDigit() }.take(5) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = Txt),
-                    shape = RoundedCornerShape(10.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Acc, unfocusedBorderColor = Line,
-                        focusedContainerColor = Bg, unfocusedContainerColor = Bg,
-                    ),
-                )
-            }
+            LabeledField(
+                label = "出图重试次数",
+                value = imgRetry,
+                onValueChange = { imgRetry = it },
+                maxDigits = 1,
+                modifier = Modifier.weight(1f),
+            )
+            LabeledField(
+                label = "首次重试等待 (ms)",
+                value = imgBackoff,
+                onValueChange = { imgBackoff = it },
+                maxDigits = 5,
+                modifier = Modifier.weight(1f),
+            )
         }
 
         Spacer(Modifier.height(10.dp))
@@ -1025,6 +1047,42 @@ private fun SettingsCard(ui: UiState, vm: MainViewModel) {
             )
             Text("允许局域网设备访问（绑定 0.0.0.0）", color = Dim, fontSize = 13.sp)
         }
+
+        Spacer(Modifier.height(14.dp))
+        HorizontalDivider(color = Line, thickness = 1.dp)
+        Spacer(Modifier.height(14.dp))
+        Text("多账号路由", color = Dim, fontSize = 12.sp)
+        Spacer(Modifier.height(6.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = multiAccount, onCheckedChange = { multiAccount = it },
+                colors = CheckboxDefaults.colors(checkedColor = Acc, uncheckedColor = Dim2),
+            )
+            Text("启用多账号自动切换", color = Dim, fontSize = 13.sp)
+        }
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            LabeledField(
+                label = "失败冷却（秒）",
+                value = cooldownSec,
+                onValueChange = { cooldownSec = it },
+                modifier = Modifier.weight(1f),
+            )
+            LabeledField(
+                label = "最多切换次数",
+                value = maxSwitches,
+                onValueChange = { maxSwitches = it },
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Text(
+            "冷却：账号失败后休息多久再回到轮转（默认 600s，上限 ${GatewayConfig.MAX_ACCOUNT_COOLDOWN / 1000}s）。" +
+                "切换次数：单次请求最多换几个账号（默认 ${GatewayConfig.DEFAULT_MAX_SWITCHES}，" +
+                "上限 ${GatewayConfig.MAX_ACCOUNT_SWITCHES}），设 0 即不换号。" +
+                "关闭多账号会退回单账号行为（只用配置页那份 token），用于快速排除路由本身的问题。",
+            color = Dim2, fontSize = 11.5.sp, lineHeight = 17.sp,
+            modifier = Modifier.padding(top = 6.dp),
+        )
 
         Spacer(Modifier.height(14.dp))
         HorizontalDivider(color = Line, thickness = 1.dp)
@@ -1144,6 +1202,12 @@ private fun SettingsCard(ui: UiState, vm: MainViewModel) {
                     } else {
                         GatewayConfig.SYSTEM_PROMPT_MERGE
                     },
+                    multiAccount = multiAccount,
+                    // 空串/非法输入回默认值而不是 0：0 对"冷却"意味着立刻可用、
+                    // 对"切换次数"意味着不换号——两者都是显式语义，
+                    // 不能因为用户清空了输入框就被静默改成关闭。
+                    accountCooldownMs = (cooldownSec.toIntOrNull() ?: (GatewayConfig.DEFAULT_ACCOUNT_COOLDOWN / 1000)) * 1000,
+                    maxAccountSwitches = maxSwitches.toIntOrNull() ?: GatewayConfig.DEFAULT_MAX_SWITCHES,
                 )            }
             Spacer(Modifier.width(10.dp))
             if (ui.settingsNotice != null) {
@@ -1163,3 +1227,438 @@ private fun SettingsCard(ui: UiState, vm: MainViewModel) {
 // ---------------- 页脚 ----------------
 
 // （原 Footer 已移除：版本与声明文案不再在每页底部展示）
+
+// ---------------- 4. 多账号 ----------------
+
+/**
+ * 账号管理卡片。
+ *
+ * 默认凭证（配置页那份 token）不在这里展示：它在路由里与列表账号完全等价
+ * （见 AccountRouter 的候选排序），但重复列一遍会让用户以为"这和上面那个 token
+ * 是两个东西"，从而把同一个凭证加进来两次 —— 那正好是路由要去重的场景。
+ * 因此这里明确写出"默认账号也在参与轮转"。
+ */
+@Composable
+private fun AccountCard(ui: UiState, vm: MainViewModel, ctx: Context) {
+    var input by remember { mutableStateOf("") }
+    var label by remember { mutableStateOf("") }
+    var confirmRemove by remember { mutableStateOf<AccountRow?>(null) }
+    var confirmReset by remember { mutableStateOf(false) }
+
+    CardBox {
+        CardTitle(3, "多账号自动切换")
+        SubText(
+            "把多个 Qwen 账号加进来，某个账号失效（token 过期 / 额度用尽 / 触发风控）时" +
+                "自动换下一个重试，对调用方完全透明。" +
+                "\n路由规则：**最久没用过的账号优先**（天然轮转，避免请求全压在一个账号上）；" +
+                "失败的账号按配置的冷却时长休息，冷却结束自动回到轮转。" +
+                if (ui.config.qwenToken.isNotBlank()) {
+                    "\n上面的默认账号（${ConfigStore.maskToken(ui.config.qwenToken)}）同样参与轮转，" +
+                        "不需要在这里重复添加。"
+                } else {
+                    ""
+                },
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "当前已配置 ${ui.accounts.size} 个账号 · 最多切换 ${ui.config.maxAccountSwitches} 次 · " +
+                "失败冷却 ${ui.config.accountCooldownMs / 1000}s",
+            color = Dim2, fontSize = 11.5.sp,
+        )
+
+        if (!ui.logSourceReady) {
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier.fillMaxWidth().background(Warn.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
+                    .border(1.dp, Warn.copy(alpha = 0.3f), RoundedCornerShape(10.dp)).padding(11.dp),
+            ) {
+                Text(
+                    "网关未启动：账号由网关进程持有，启动后才可管理（否则会出现" +
+                        "「界面里改的」和「实际生效的」不是同一份数据）。",
+                    color = Warn, fontSize = 12.sp, lineHeight = 18.sp,
+                )
+            }
+        }
+
+        if (ui.accounts.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            ui.accounts.forEach { a ->
+                AccountRowItem(
+                    row = a,
+                    actionable = ui.logSourceReady,
+                    onToggle = { enabled -> vm.setAccountEnabled(a.id, enabled) },
+                    onRemove = { confirmRemove = a },
+                )
+                Spacer(Modifier.height(8.dp))
+            }
+        }
+
+        Spacer(Modifier.height(4.dp))
+        OutlinedTextField(
+            value = label,
+            onValueChange = { label = it },
+            modifier = Modifier.fillMaxWidth(),
+            placeholder = { Text("备注名（可选，如「主号」「备用」）", color = Dim2, fontSize = 12.5.sp) },
+            singleLine = true,
+            textStyle = LocalTextStyle.current.copy(fontSize = 13.sp, color = Txt),
+            shape = RoundedCornerShape(10.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Acc, unfocusedBorderColor = Line,
+                focusedContainerColor = Bg, unfocusedContainerColor = Bg,
+            ),
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = input,
+            onValueChange = { input = it },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 84.dp),
+            placeholder = { Text("粘贴该账号的 Token 或整段 Cookie", color = Dim2, fontSize = 12.5.sp) },
+            textStyle = LocalTextStyle.current.copy(
+                fontSize = 12.5.sp, fontFamily = FontFamily.Monospace, color = Txt,
+            ),
+            shape = RoundedCornerShape(10.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Acc, unfocusedBorderColor = Line,
+                focusedContainerColor = Bg, unfocusedContainerColor = Bg,
+            ),
+        )
+        Spacer(Modifier.height(10.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PrimaryButton("添加账号", enabled = ui.logSourceReady && input.isNotBlank()) {
+                vm.addAccount(input, label)
+                input = ""
+                label = ""
+            }
+            GhostButton("从剪贴板粘贴") {
+                val t = ClipboardUtil.readCredential(ctx)
+                if (t == null) {
+                    vm.notifyToast("剪贴板里没有识别到 Qwen 凭证")
+                } else {
+                    input = t
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GhostButton("重置全部健康度", enabled = ui.logSourceReady) { confirmReset = true }
+        }
+        MessageBanner(ui.accountNotice)
+
+        Text(
+            "「重置健康度」用于手动过完滑块后让账号立刻恢复（不必等冷却到期）；" +
+                "它只清失败记录，不动凭证与开关。停用的账号不参与轮转，" +
+                "但保留在列表里，可随时重新启用。",
+            color = Dim2, fontSize = 11.5.sp, lineHeight = 17.sp,
+            modifier = Modifier.padding(top = 8.dp),
+        )
+
+        val removing = confirmRemove
+        if (removing != null) {
+            AlertDialog(
+                onDismissRequest = { confirmRemove = null },
+                title = { Text("删除账号「${removing.label}」？", color = Txt) },
+                text = { Text("仅从本机列表移除，不会影响该账号在 Qwen 侧的登录状态。", color = Dim) },
+                confirmButton = {
+                    TextButton(onClick = { vm.removeAccount(removing.id); confirmRemove = null }) {
+                        Text("删除", color = Bad)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmRemove = null }) { Text("取消", color = Dim) }
+                },
+                containerColor = CardBg,
+            )
+        }
+        if (confirmReset) {
+            AlertDialog(
+                onDismissRequest = { confirmReset = false },
+                title = { Text("重置全部账号健康度？", color = Txt) },
+                text = { Text("所有账号的失败记录会被清空，立即重新参与轮转。", color = Dim) },
+                confirmButton = {
+                    TextButton(onClick = { vm.resetAccountHealth(); confirmReset = false }) {
+                        Text("重置", color = Acc)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmReset = false }) { Text("取消", color = Dim) }
+                },
+                containerColor = CardBg,
+            )
+        }
+    }
+}
+
+/** 单个账号行：状态 + 上次使用时间 + 启用开关 + 删除 */
+@Composable
+private fun AccountRowItem(
+    row: AccountRow,
+    actionable: Boolean,
+    onToggle: (Boolean) -> Unit,
+    onRemove: () -> Unit,
+) {
+    val unhealthy = row.lastError.isNotEmpty()
+    val statusColor = when {
+        !row.enabled -> Dim2
+        unhealthy -> Warn
+        else -> Ok
+    }
+    val statusText = when {
+        !row.enabled -> "已停用"
+        unhealthy -> "上次失败 · ${row.lastErrorCode.ifEmpty { "未知" }}"
+        else -> "正常"
+    }
+
+    Column(
+        Modifier.fillMaxWidth()
+            .background(Bg, RoundedCornerShape(12.dp))
+            .border(1.dp, Line, RoundedCornerShape(12.dp))
+            .padding(12.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(7.dp).background(statusColor, RoundedCornerShape(4.dp)))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                row.label, color = Txt, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+            )
+            Badge(statusText, statusColor)
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            row.masked + " · " + relativeTime(row.lastUsedAt),
+            color = Dim2, fontSize = 11.5.sp, fontFamily = FontFamily.Monospace,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+        if (unhealthy) {
+            Spacer(Modifier.height(3.dp))
+            Text(
+                row.lastError.replace("\n", " "), color = Warn, fontSize = 11.5.sp,
+                maxLines = 2, overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            GhostButton(
+                text = if (row.enabled) "停用" else "启用",
+                enabled = actionable,
+            ) { onToggle(!row.enabled) }
+            GhostButton(
+                text = "删除",
+                enabled = actionable,
+                onClick = onRemove,
+            )
+        }
+    }
+}
+
+/**
+ * 相对时间。
+ *
+ * 不用绝对时间戳：用户要回答的是"这个账号是不是刚用过"，而不是"它几点几分被用过"。
+ * 绝对时间在跨天时反而要心算。
+ */
+private fun relativeTime(at: Long): String {
+    if (at <= 0L) return "从未使用"
+    val d = System.currentTimeMillis() - at
+    return when {
+        d < 0 -> "刚刚"
+        d < 60_000 -> "刚刚用过"
+        d < 3_600_000 -> "${d / 60_000} 分钟前"
+        d < 86_400_000 -> "${d / 3_600_000} 小时前"
+        else -> "${d / 86_400_000} 天前"
+    }
+}
+
+// ---------------- 5. 调用日志 ----------------
+
+/**
+ * 调用日志：成功/失败一览 + 导出分享。
+ *
+ * 失败条目优先展示（置顶分组）：排查时最想看的是"哪几次错了"，
+ * 在几百条成功里翻失败是反人性的。这与导出文本里"失败汇总在前"是同一个取舍。
+ */
+@Composable
+private fun LogCard(ui: UiState, vm: MainViewModel, ctx: Context) {
+    var includeTrace by remember { mutableStateOf(true) }
+    var confirmClear by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    CardBox {
+        CardTitle(null, "调用日志")
+        SubText(
+            "每处理一次请求都会记一条（成功一条、失败一条），App 重启后仍在。" +
+                "导出格式是 Markdown，含失败汇总、账号链路与每一轮的诊断行 ——" +
+                "直接发给别人（或 AI）就能定位问题，不必守着手机复现。",
+        )
+
+        if (!ui.logSourceReady) {
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier.fillMaxWidth().background(Warn.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
+                    .border(1.dp, Warn.copy(alpha = 0.3f), RoundedCornerShape(10.dp)).padding(11.dp),
+            ) {
+                Text("网关未启动：日志由网关进程写入，启动后这里才会出现记录。", color = Warn, fontSize = 12.sp)
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+            StatTile("累计请求", "${ui.logTotal}", "本次数据", Modifier.weight(1f))
+            StatTile(
+                "失败", "${ui.logFails}",
+                if (ui.logTotal > 0) "占比 ${"%.1f".format(ui.logFails * 100.0 / ui.logTotal)}%" else "占比 -",
+                Modifier.weight(1f),
+                valueColor = if (ui.logFails > 0) Bad else Ok,
+            )
+        }
+        if (ui.lastFailure.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier.fillMaxWidth().background(Bad.copy(alpha = 0.08f), RoundedCornerShape(10.dp))
+                    .border(1.dp, Bad.copy(alpha = 0.25f), RoundedCornerShape(10.dp)).padding(11.dp),
+            ) {
+                Column {
+                    Text("最近一次失败", color = Bad, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        ui.lastFailure, color = Txt, fontSize = 11.5.sp,
+                        fontFamily = FontFamily.Monospace, lineHeight = 17.sp,
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(
+                checked = includeTrace, onCheckedChange = { includeTrace = it },
+                colors = CheckboxDefaults.colors(checkedColor = Acc, uncheckedColor = Dim2),
+            )
+            Text("导出时附带诊断行（体积更大，定位更准）", color = Dim, fontSize = 13.sp)
+        }
+        Spacer(Modifier.height(4.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PrimaryButton("导出并分享") {
+                val text = vm.exportLogs(includeTrace)
+                if (text == null) {
+                    vm.notifyToast("网关未启动，暂无可导出的日志")
+                } else {
+                    val uri = LogExportIo.writeShareable(ctx, text)
+                    if (uri == null) {
+                        // 落盘失败时退化成"复制全文"：导出的目的就是把它拿出来，
+                        // 直接失败会让用户在一个纯粹是 IO 的问题上卡死。
+                        ClipboardUtil.write(ctx, "Qwen2API 日志", text)
+                        vm.notifyToast("无法生成分享文件，已将日志全文复制到剪贴板（${text.length} 字）")
+                    } else {
+                        scope.launch {
+                            runCatching { ctx.startActivity(LogExportIo.shareIntent(uri)) }
+                                .onFailure {
+                                    ClipboardUtil.write(ctx, "Qwen2API 日志", text)
+                                    vm.notifyToast("没有可用的分享目标，已复制日志全文到剪贴板")
+                                }
+                        }
+                    }
+                }
+            }
+            GhostButton("复制全文") {
+                val text = vm.exportLogs(includeTrace)
+                if (text == null) {
+                    vm.notifyToast("网关未启动，暂无可导出的日志")
+                } else {
+                    ClipboardUtil.write(ctx, "Qwen2API 日志", text)
+                    vm.notifyToast("已复制 ${text.length} 字到剪贴板")
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        GhostButton("清空日志", enabled = ui.logRows.isNotEmpty()) { confirmClear = true }
+
+        if (ui.logRows.isNotEmpty()) {
+            Spacer(Modifier.height(14.dp))
+            Text(
+                "最近记录（新 → 旧，最多 ${ui.logRows.size} 条）",
+                color = Dim2, fontSize = 11.5.sp,
+            )
+            Spacer(Modifier.height(8.dp))
+            ui.logRows.forEach { e ->
+                LogRowItem(e)
+                Spacer(Modifier.height(7.dp))
+            }
+        } else if (ui.logSourceReady) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "还没有记录：网关启动后每处理一次请求就会出现一条。",
+                color = Dim2, fontSize = 12.sp,
+            )
+        }
+
+        if (confirmClear) {
+            AlertDialog(
+                onDismissRequest = { confirmClear = false },
+                title = { Text("清空调用日志？", color = Txt) },
+                text = { Text("会同时清空累计统计与落盘文件，且无法恢复。", color = Dim) },
+                confirmButton = {
+                    TextButton(onClick = { vm.clearLogs(); confirmClear = false }) {
+                        Text("清空", color = Bad)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmClear = false }) { Text("取消", color = Dim) }
+                },
+                containerColor = CardBg,
+            )
+        }
+    }
+}
+
+/** 单条日志 */
+@Composable
+private fun LogRowItem(e: ApiLogEntry) {
+    val ok = e.level == ApiLogLevel.OK
+    val c = if (ok) Ok else Bad
+    val fmt = remember { java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US) }
+
+    Column(
+        Modifier.fillMaxWidth()
+            .background(Bg, RoundedCornerShape(12.dp))
+            .border(1.dp, if (ok) Line else c.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+            .padding(11.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (ok) "✓" else "✗", color = c, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.width(6.dp))
+            Text(
+                e.method + " " + e.path,
+                color = Txt, fontSize = 12.sp, fontFamily = FontFamily.Monospace,
+                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+            )
+            Text(fmt.format(java.util.Date(e.at)), color = Dim2, fontSize = 10.5.sp)
+        }
+        Spacer(Modifier.height(5.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            MiniTag("HTTP ${e.status}")
+            MiniTag("${e.ms}ms")
+            if (e.attempts > 1) MiniTag("尝试 ${e.attempts} 次")
+            if (e.switches > 0) MiniTag("切换 ${e.switches} 次")
+        }
+        Spacer(Modifier.height(5.dp))
+        Text(
+            "账号 " + e.accountLabel.ifEmpty { "(默认账号)" } +
+                if (e.model.isNotEmpty()) " · ${e.model}" else "",
+            color = Dim2, fontSize = 11.sp,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+        )
+        if (e.summary.isNotEmpty()) {
+            Spacer(Modifier.height(3.dp))
+            Text(e.summary, color = Dim, fontSize = 11.sp)
+        }
+        if (e.errorCode.isNotEmpty() || e.message.isNotEmpty()) {
+            Spacer(Modifier.height(3.dp))
+            Text(
+                "[" + e.errorCode + "] " + e.message.replace("\n", " "),
+                color = c, fontSize = 11.sp, lineHeight = 16.sp,
+                maxLines = 3, overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}

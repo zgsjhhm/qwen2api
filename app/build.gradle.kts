@@ -21,8 +21,8 @@ android {
         applicationId = "com.qwen2api.tx"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.2.1"
+        versionCode = 4
+        versionName = "1.4.0"
         ndk { abiFilters += "arm64-v8a" }
         vectorDrawables { useSupportLibrary = true }
     }

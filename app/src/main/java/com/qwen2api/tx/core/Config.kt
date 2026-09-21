@@ -44,6 +44,33 @@ data class GatewayConfig(
      *    自己的破提示词、行为不可控」的场景。只覆盖 system，user 内容不动。
      */
     val systemPromptMode: String = SYSTEM_PROMPT_MERGE,
+    /**
+     * 多账号路由开关。
+     *
+     * 关掉时行为与改动前**逐字节一致**（只用 `qwenToken`，不做切换）——
+     * 这是给"我只想保持简单、不想让网关自己换账号"的用户留的退路，
+     * 也是出问题时最快的一条回退路径。
+     */
+    val multiAccount: Boolean = DEFAULT_MULTI_ACCOUNT,
+    /**
+     * 账号失败后的冷却时长（毫秒）。
+     *
+     * 默认 10 分钟，取值依据：
+     *  - 太短（如 30s）没有意义：上游风控/额度类失败按秒恢复的情况极少，
+     *    立刻重试只是把同一个失败再打一遍，还会加重风控；
+     *  - 太长（如 1 小时）会让"过完滑块验证想立刻恢复"的用户只能重启 App。
+     *    10 分钟是实测"风控自然冷却"的常见量级，且用户可自行调整。
+     */
+    val accountCooldownMs: Int = DEFAULT_ACCOUNT_COOLDOWN,
+    /**
+     * 单次请求最多切换几个账号。
+     *
+     * 必须有上限：多账号的全部意义是"这个不行换一个试试"，
+     * 而不是"把所有账号轮一遍"。账号多时无上限地切会让一次请求的最坏耗时
+     * 变成 `账号数 × 账号超时`（10 个账号就是十几分钟），而客户端的读超时
+     * 通常只有 60~120 秒 —— 用户看到的会是"超时"，而不是最后那个真实的错误。
+     */
+    val maxAccountSwitches: Int = DEFAULT_MAX_SWITCHES,
 ) {
     fun copyWith(
         port: Int? = null,
@@ -59,6 +86,10 @@ data class GatewayConfig(
         systemPrompt: String? = null,
         systemPromptEnabled: Boolean? = null,
         systemPromptMode: String? = null,
+        // ---- 多账号路由 ----
+        multiAccount: Boolean? = null,
+        accountCooldownMs: Int? = null,
+        maxAccountSwitches: Int? = null,
     ): GatewayConfig = GatewayConfig(
         port = port ?: this.port,
         host = host ?: this.host,
@@ -73,13 +104,16 @@ data class GatewayConfig(
         systemPrompt = systemPrompt ?: this.systemPrompt,
         systemPromptEnabled = systemPromptEnabled ?: this.systemPromptEnabled,
         systemPromptMode = systemPromptMode ?: this.systemPromptMode,
+        multiAccount = multiAccount ?: this.multiAccount,
+        accountCooldownMs = accountCooldownMs ?: this.accountCooldownMs,
+        maxAccountSwitches = maxAccountSwitches ?: this.maxAccountSwitches,
     )
 
     companion object {
         const val DEFAULT_PORT = 8818
         const val DEFAULT_HOST = "127.0.0.1"
         const val DEFAULT_MODEL = "qwen3.8-max"
-        const val VERSION = "1.2.1"
+        const val VERSION = "1.4.0"
 
         /** 默认重试 2 次（1.5s 起指数退避，总等待上限约 4.5s） */
         const val DEFAULT_IMAGE_RETRY = 2
@@ -100,6 +134,34 @@ data class GatewayConfig(
 
         /** 全局 System Prompt 注入方式：覆盖调用方 system */
         const val SYSTEM_PROMPT_REPLACE = "replace"
+
+        /**
+         * 默认开启多账号路由。
+         *
+         * 默认开而不是默认关：账号列表为空时它**没有任何行为差异**（候选里只有
+         * 默认账号，永远选它），因此对老用户零影响；而一旦用户添加了第二个账号，
+         * 功能立刻可用 —— 若默认关，用户的预期是"我加好了就该自动切换"，
+         * 实际却什么都没发生，属于最难自查的一类"配置了但不生效"。
+         */
+        const val DEFAULT_MULTI_ACCOUNT = true
+
+        /** 账号失败后的默认冷却时长（10 分钟） */
+        const val DEFAULT_ACCOUNT_COOLDOWN = 10 * 60 * 1000
+
+        /**
+         * 冷却时长上限（2 小时）。
+         *
+         * 上限的意义在于兜住"用户手滑填 999999"：冷却过长的直接后果是
+         * 账号在本进程内**永远不会被选中**，而界面上只显示"冷却中"，
+         * 用户很难意识到是自己把分钟当秒填了。
+         */
+        const val MAX_ACCOUNT_COOLDOWN = 2 * 60 * 60 * 1000
+
+        /** 单次请求默认最多切换 2 个账号（= 最多尝试 3 个凭证） */
+        const val DEFAULT_MAX_SWITCHES = 2
+
+        /** 单次请求允许的最大切换数 */
+        const val MAX_ACCOUNT_SWITCHES = 5
 
         /**
          * 全局 System Prompt 长度上限（字符）。
@@ -308,6 +370,22 @@ object ConfigStore {
         o.put("systemPrompt", cfg.systemPrompt)
         o.put("systemPromptEnabled", cfg.systemPromptEnabled)
         o.put("systemPromptMode", cfg.systemPromptMode)
+        // 多账号路由参数也进导出：换机恢复时若漏掉，用户会遇到
+        // 「以前会自动切换，现在不切了」而配置页看起来一切正常。
+        o.put("multiAccount", cfg.multiAccount)
+        o.put("accountCooldownMs", cfg.accountCooldownMs)
+        o.put("maxAccountSwitches", cfg.maxAccountSwitches)
         return o
     }
+
+    /**
+     * 归一化账号冷却时长。
+     *
+     * 收敛到 `[0, MAX_ACCOUNT_COOLDOWN]`：0 表示"失败后立刻可以再用"
+     *（等价于关闭冷却，给"就想让它一直重试"的用户），负值按 0 处理。
+     */
+    fun normalizeAccountCooldown(raw: Int): Int = raw.coerceIn(0, GatewayConfig.MAX_ACCOUNT_COOLDOWN)
+
+    /** 归一化最大切换账号数 */
+    fun normalizeMaxSwitches(raw: Int): Int = raw.coerceIn(0, GatewayConfig.MAX_ACCOUNT_SWITCHES)
 }

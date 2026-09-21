@@ -47,6 +47,23 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!--
+            导出日志后走系统分享需要把文件暴露给目标应用。
+            Android 7+ 直接传 file:// 会抛 FileUriExposedException，
+            因此必须经 FileProvider 换成 content://（authority 与 file_paths 里的名字对应）。
+            export 目录只映射 cacheDir/log-export：账号凭证等敏感数据在别的目录，
+            不会被这个 provider 暴露出去。
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 
 </manifest>

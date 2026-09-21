@@ -41,6 +41,21 @@ class GatewayService : android.app.Service() {
         var lastError: String? = null
             private set
 
+        /**
+         * 当前路由实例的全局引用（UI 与管理接口读取账号/日志的入口）。
+         *
+         * 为什么必须有一个跨进程内可访问的引用：账号列表与调用日志**归路由所有**
+         *（路由在构建时注入仓储），而 UI 跑在 Activity 里、拿不到 Service 的实例。
+         * 若 UI 自己再建一份仓储，两处会各写各的 —— 「UI 里删掉的账号，网关这一轮
+         * 还在用」正是这样来的。这里指向同一个对象，从根上排除这种分叉。
+         *
+         * 停止网关时置空：留着会指向已停止服务里那份仓储，
+         * 让 UI 以为账号/日志仍然可用，而实际后台已经不再记录。
+         */
+        @Volatile
+        var activeRouter: GatewayRouter? = null
+            private set
+
         const val ACTION_START = "com.qwen2api.tx.START"
         const val ACTION_STOP = "com.qwen2api.tx.STOP"
     }
@@ -78,6 +93,7 @@ class GatewayService : android.app.Service() {
             val s = MiniHttpServer(port, host) { req, res -> r.handle(req, res) }
             s.start()
             router = r
+            activeRouter = r
             server = s
             isRunning = true
             boundPort = s.boundPort
@@ -86,6 +102,7 @@ class GatewayService : android.app.Service() {
             updateNotification("http://127.0.0.1:${s.boundPort} 已就绪")
         } catch (e: Exception) {
             isRunning = false
+            activeRouter = null
             lastError = e.message ?: e.toString()
             Log.e(TAG, "gateway start failed", e)
             updateNotification("启动失败: $lastError")
@@ -96,6 +113,7 @@ class GatewayService : android.app.Service() {
         try { server?.stop() } catch (e: Exception) { /* ignore */ }
         server = null
         router = null
+        activeRouter = null
         isRunning = false
         boundPort = 0
         Log.i(TAG, "gateway stopped")

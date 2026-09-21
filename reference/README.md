@@ -238,6 +238,32 @@ curl http://127.0.0.1:8818/v1/files \
 
 常见 code：`NO_TOKEN`（未配 Token）/ `AUTH_FAILED`（Token 失效，重新获取）/ `NETWORK`（无法连上 Qwen）/ `UPSTREAM_5xx`（Qwen 侧错误）。
 
+### 管理接口：多账号与调用日志
+
+本机（127.0.0.1）免鉴权的管理接口，供 App 界面使用，也便于脚本化排查：
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/admin/api/status` | GET | 服务状态，含 `multiAccount`、`accountCooldownMs`、`maxAccountSwitches`、`accounts`（含健康度）、`lastAccountRoute` |
+| `/admin/api/accounts` | GET | 账号列表（凭证只回掩码，绝不回明文） |
+| `/admin/api/accounts/add` | POST | 新增账号（`token` + 可选 `label`）；凭证重复会被拒绝 |
+| `/admin/api/accounts/update` | POST | 改名 / 启用停用 |
+| `/admin/api/accounts/remove` | POST | 删除账号 |
+| `/admin/api/accounts/reset` | POST | 重置全部账号健康度（手动过完滑块后立刻恢复） |
+| `/admin/api/logs` | GET | 最近调用日志（`limit` 可选） |
+| `/admin/api/logs/export` | GET | 导出 Markdown 日志（`trace=0` 可关闭诊断行） |
+| `/admin/api/logs/clear` | POST | 清空日志与统计 |
+
+多账号语义：
+
+- 候选排序为「健康优先 → 最久没用过优先 → 失败时刻早者优先」，轮转不依赖定时器（读时计算，避免被系统 Doze 掐停）；
+- 账号级失败（token 失效 / 额度用尽 / 风控）写冷却，冷却到期自动回到轮转；请求自身的错误（参数非法等）不写冷却；
+- 流式响应在已向下游发过字节后不再换号（否则客户端会看到两段拼接的回复）；
+- 关闭多账号开关即退化为单账号，行为与旧版一致。
+
+调用日志同时落盘（应用私有目录 `filesDir/api_call_log.jsonl`，环形上限 400 条），
+导出文本含失败汇总、账号链路与每轮诊断行，可直接发给他人或 AI 定位问题。
+
 ---
 
 ## 架构与工作原理

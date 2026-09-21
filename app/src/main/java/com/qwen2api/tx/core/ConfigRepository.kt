@@ -53,6 +53,18 @@ class PrefsConfigRepository(context: Context) : ConfigRepository {
             systemPromptMode = ConfigStore.normalizeSystemPromptMode(
                 prefs.getString(KEY_SYSTEM_PROMPT_MODE, GatewayConfig.SYSTEM_PROMPT_MERGE),
             ),
+            multiAccount = prefs.getBoolean(
+                KEY_MULTI_ACCOUNT, GatewayConfig.DEFAULT_MULTI_ACCOUNT,
+            ),
+            // 归一化后再落进 config：上限保护必须在这里也生效，
+            // 否则旧版本/手工改过的 prefs 能塞进任意大的值，
+            // 而 AccountRouter 的冷却判定会因此永久锁死账号。
+            accountCooldownMs = ConfigStore.normalizeAccountCooldown(
+                prefs.getInt(KEY_ACCOUNT_COOLDOWN, GatewayConfig.DEFAULT_ACCOUNT_COOLDOWN),
+            ),
+            maxAccountSwitches = ConfigStore.normalizeMaxSwitches(
+                prefs.getInt(KEY_MAX_SWITCHES, GatewayConfig.DEFAULT_MAX_SWITCHES),
+            ),
         )
         if (cfg.apiKey.isBlank()) {
             cfg = cfg.copyWith(apiKey = ConfigStore.generateApiKey())
@@ -83,6 +95,9 @@ class PrefsConfigRepository(context: Context) : ConfigRepository {
             .putString(KEY_SYSTEM_PROMPT, cfg.systemPrompt)
             .putBoolean(KEY_SYSTEM_PROMPT_ENABLED, cfg.systemPromptEnabled)
             .putString(KEY_SYSTEM_PROMPT_MODE, ConfigStore.normalizeSystemPromptMode(cfg.systemPromptMode))
+            .putBoolean(KEY_MULTI_ACCOUNT, cfg.multiAccount)
+            .putInt(KEY_ACCOUNT_COOLDOWN, ConfigStore.normalizeAccountCooldown(cfg.accountCooldownMs))
+            .putInt(KEY_MAX_SWITCHES, ConfigStore.normalizeMaxSwitches(cfg.maxAccountSwitches))
             .apply()
     }
 
@@ -108,6 +123,9 @@ class PrefsConfigRepository(context: Context) : ConfigRepository {
         const val KEY_SYSTEM_PROMPT = "systemPrompt"
         const val KEY_SYSTEM_PROMPT_ENABLED = "systemPromptEnabled"
         const val KEY_SYSTEM_PROMPT_MODE = "systemPromptMode"
+        const val KEY_MULTI_ACCOUNT = "multiAccount"
+        const val KEY_ACCOUNT_COOLDOWN = "accountCooldownMs"
+        const val KEY_MAX_SWITCHES = "maxAccountSwitches"
     }
 }
 

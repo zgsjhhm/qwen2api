@@ -304,12 +304,33 @@ open class QwenClient(
         const val MAX_STREAM_NOTE_PREFIX = "\n\n---\n[Qwen2API] 已达到 "
     }
 
-    fun hasToken(): Boolean = qwenToken.trim().isNotEmpty()
+    /**
+     * 请求级凭证覆盖（多账号路由用）。
+     *
+     * ## 为什么是属性而不是构造参数
+     *
+     * 网关每个请求都要用**当轮选中的账号**新建客户端。改构造器签名会波及全部
+     * 上游客户端的子类与测试假实现（`QwenClient("fake-token", 0)` 这类调用全仓
+     * 十几处，其中多数只 override `chatStream`），签名一变就得全部跟着改 ——
+     * 一个纯新增能力不该有这种代价。
+     *
+     * 覆盖优先级高于构造参数；为 null 时行为与改动前逐字节一致。
+     *
+     * ⚠ 用法约定：构造完立刻赋值、之后不再改。它在 [headers] 里被读取，
+     * 而 [headers] 会被并发调用（图片链路会并行发子请求）。路由层因此每轮
+     * 新建客户端并赋值，而不是复用同一个实例再改属性。
+     */
+    var credentialOverride: String? = null
+
+    /** 当前生效的凭证（覆盖优先） */
+    private fun effectiveToken(): String = credentialOverride ?: qwenToken
+
+    fun hasToken(): Boolean = effectiveToken().trim().isNotEmpty()
 
     // ---------------- 请求头 ----------------
 
     private fun headers(extra: Map<String, String> = emptyMap()): Map<String, String> {
-        val token = qwenToken.trim()
+        val token = effectiveToken().trim()
         val h = LinkedHashMap<String, String>()
         h["Accept"] = "application/json"
         h["Accept-Language"] = "en-US,en;q=0.9"
