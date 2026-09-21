@@ -3,6 +3,7 @@ build/
 .gradle/
 .kotlin/
 local.properties
+kotlin-tooling-metadata.json
 
 # ---- APK decode residue ----
 .apk-unzip-residue/
@@ -14,6 +15,10 @@ keystore.properties
 *.jks
 *.keystore
 /keystore/
+
+# ---- Build artifacts are never committed (build locally or via CI) ----
+/dist/*.apk
+/dist/*.aab
 
 # ---- IDE ----
 .idea/

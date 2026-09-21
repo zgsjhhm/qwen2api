@@ -9,29 +9,24 @@
 - minSdk: 26
 - targetSdk: 34
 - ABI: `arm64-v8a`
-- APK: [`dist/qwen2api-t2i.apk`](dist/qwen2api-t2i.apk)
 
-APK SHA-256:
-
-```text
-2c7a644c3d1694c8265a3c52eb83a091fe86d3598943d743339dcd5180142586
-```
+APK 不入库，通过下方 Release 构建流程在本地产出。
 
 ## 构建
 
 使用 Android Studio 或已安装的 Gradle 环境打开本目录：
 
 ```bash
-./gradlew assembleDebug
+./gradlew assembleRelease
 ```
 
 若没有 Gradle wrapper，可使用与项目兼容的 Gradle 8.x 执行：
 
 ```bash
-gradle assembleDebug
+gradle assembleRelease
 ```
 
-输出位于 `app/build/outputs/apk/debug/`。发布签名配置通过本地未入库的 `keystore.properties` 提供，示例配置不会提交到仓库。
+签名的 Release APK 输出位于 `app/build/outputs/apk/release/`。发布签名配置通过本地未入库的 `keystore.properties` 提供（`storeFile` 指向密钥库、`keyAlias`/`storePassword`/`keyPassword`），文件不存在时 Release 签名不会生效。
 
 ## 使用
 
@@ -48,7 +43,7 @@ gradle assembleDebug
 - `app/src/test/`：单元测试
 - `reference/`：配套 Qwen Studio API 参考实现与说明
 - `tools/`：验证和端到端辅助脚本
-- `dist/`：当前发布 APK
+- `dist/`：本地构建产物（不入库）
 
 ## 免责声明
 
