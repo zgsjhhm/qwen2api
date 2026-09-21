@@ -605,6 +605,9 @@ class ImageEditTest {
 
     @Test
     fun `重试次数透出到响应便于排查`() {
+        // 这条只钉「网关把 result.retries 透出到 qwen 字段」这一层（假客户端自带 2），
+        // 重试计数**来源**是否正确由 ImageRetryObservabilityTest 走真实重试循环验证 ——
+        // 两者分离是因为这里 override 了 generateImage，看不到累加逻辑。
         startServer(
             editResult = ImageResult(
                 chatId = "c",

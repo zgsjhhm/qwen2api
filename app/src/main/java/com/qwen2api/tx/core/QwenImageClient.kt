@@ -386,24 +386,31 @@ open class QwenImageClient(
                         onEvent = if (attempt == 0) onEvent else null,
                     )
                 }
+                // 计数从 withRetry 取，而不是从 ImageResult 上取：
+                // ImageResult.retries 由「单轮流解析」构造，那层根本不知道外面重试了几次，
+                // 照抄它会让响应里的 retries 结构性地恒为 0（排查时反而误导成「没重试」）。
                 retries += one.retries
-                if (one.chatId.isNotEmpty()) chatId = one.chatId
-                images.addAll(one.images)
-                if (one.caption.isNotEmpty() && caption.isEmpty()) caption = one.caption
+                val r = one.value
+                if (r.chatId.isNotEmpty()) chatId = r.chatId
+                images.addAll(r.images)
+                if (r.caption.isNotEmpty() && caption.isEmpty()) caption = r.caption
             } catch (e: QwenException) {
-                lastErr = e
+                // 失败路径上的尝试次数同样要留证，否则「重试到底跑没跑」只剩猜
+                val attempts = (e as? RetryExhausted)?.attempts ?: 0
+                retries += attempts
+                lastErr = (e as? RetryExhausted)?.original ?: e
+                logImage("t2i fail [${e.code}] attempts=$attempts got=${images.size}/$count")
                 // 第一张就失败 -> 直接抛出；后续失败则保留已有结果（部分成功优于全失败）
-                if (images.isEmpty()) throw e
-                logImage("t2i n>1 partial: got=${images.size}/$count, stop on [${e.code}]")
                 break
             }
         }
         if (images.isEmpty()) {
-            throw lastErr ?: QwenException(
+            val fail = lastErr ?: QwenException(
                 "UPSTREAM_EMPTY",
                 "上游未返回任何图片。可能原因: 提示词被内容安全拦截, 或账号无文生图额度",
                 502,
             )
+            throw fail.withRetries(retries)
         }
         return ImageResult(
             chatId = chatId,
@@ -473,22 +480,25 @@ open class QwenImageClient(
                     )
                 }
                 retries += one.retries
-                if (one.chatId.isNotEmpty()) chatId = one.chatId
-                images.addAll(one.images)
-                if (one.caption.isNotEmpty() && caption.isEmpty()) caption = one.caption
+                val r = one.value
+                if (r.chatId.isNotEmpty()) chatId = r.chatId
+                images.addAll(r.images)
+                if (r.caption.isNotEmpty() && caption.isEmpty()) caption = r.caption
             } catch (e: QwenException) {
-                lastErr = e
-                if (images.isEmpty()) throw e
-                logImage("edit n>1 partial: got=${images.size}/$count, stop on [${e.code}]")
+                val attempts = (e as? RetryExhausted)?.attempts ?: 0
+                retries += attempts
+                lastErr = (e as? RetryExhausted)?.original ?: e
+                logImage("edit fail [${e.code}] attempts=$attempts got=${images.size}/$count")
                 break
             }
         }
         if (images.isEmpty()) {
-            throw lastErr ?: QwenException(
+            val fail = lastErr ?: QwenException(
                 "UPSTREAM_EMPTY",
                 "上游未返回任何改图结果。可能原因: 源图或提示词被内容安全拦截, 或账号额度用尽",
                 502,
             )
+            throw fail.withRetries(retries)
         }
         return ImageResult(
             chatId = chatId,
@@ -511,12 +521,17 @@ open class QwenImageClient(
      *
      * **故意排除**：`AUTH_FAILED`（token 问题重试无用）、`BAD_REQUEST`（参数写错了）、
      * `FILE_TOO_LARGE` / `UPLOAD_FAIL`（重试只会再传一遍同样的东西）、
-     * `PARSE_FAILED`（服务端明确拒绝该文件格式）。
+     * `PARSE_FAILED`（服务端明确拒绝该文件格式）、
+     * [RiskControl.THROTTLE_CODE]（风控态下重试只会加重封禁）。
      */
     internal fun isRetryable(code: String): Boolean = when (code) {
         "UPSTREAM_EMPTY", "UPSTREAM_ERROR", "UPSTREAM_UNKNOWN" -> true
         "AUTH_FAILED", "NO_TOKEN", "BAD_REQUEST", "FILE_TOO_LARGE",
         "UPLOAD_FAIL", "PARSE_FAILED", "CREATE_CHAT_FAIL", "BAD_RESPONSE",
+        // 风控命中：不再按 2.5s 起步的短退避重试。
+        // 实测同一风控响应下 retry=4 耗时 58s、retry=0 耗时 8s，错误完全一样 ——
+        // 多出来的 50s 只是把上游打得更多，而风控正是按请求数判定的。
+        RiskControl.THROTTLE_CODE,
         -> false
         else -> code.startsWith("UPSTREAM_5") ||
             code.startsWith("NETWORK") ||
@@ -538,21 +553,27 @@ open class QwenImageClient(
      * 否则同一次 Thinking/Caption 会被推给客户端两遍，表现为答案里出现重复文字，
      * 而调用方完全看不出是重试造成的。
      *
+     * 返回 [AttemptResult] 而不是裸结果：重试次数必须是**这一层**的事实。
+     * 之前调用方改从 `ImageResult.retries` 累加，而那个字段由单轮流解析构造、
+     * 恒为默认值 0，于是对外回显的 `retries` 永远是 0 —— 恰好把「到底重试没有」
+     * 这个排查线索变成了假信息。
+     *
      * @param block (attempt) -> 结果；attempt 从 0 开始计
      */
-    private suspend fun <T> withRetry(block: suspend (Int) -> T): T {
+    private suspend fun <T> withRetry(block: suspend (Int) -> T): AttemptResult<T> {
         var attempt = 0
         var last: QwenException? = null
         while (true) {
             try {
                 val r = block(attempt)
                 if (attempt > 0) logImage("retry succeeded after $attempt attempt(s)")
-                return r
+                return AttemptResult(r, attempt)
             } catch (e: QwenException) {
                 last = e
                 if (attempt >= retryCount || !isRetryable(e.code)) {
                     if (attempt > 0) logImage("retry exhausted (${attempt}x) on [${e.code}]")
-                    throw e
+                    // 已失败：把「尝试了几次」一并带出去（成功路径上就是重试次数）
+                    throw RetryExhausted(e, attempt)
                 }
                 val wait = retryDelayMs(attempt)
                 logImage("retryable [${e.code}] -> wait ${wait}ms (attempt ${attempt + 1}/$retryCount)")
@@ -562,7 +583,16 @@ open class QwenImageClient(
         }
     }
 
-    private suspend fun generateOnce(
+    /**
+     * 单轮文生图（建会话 -> 发请求 -> 解析流）。
+     *
+     * `protected open` **仅为测试可替换性**：`retries` 的正确性只有在
+     * 「走了真实 [generateImage] + [withRetry] 循环」的用例里才成立。
+     * 之前的用例直接 override [generateImage] 并自己构造 `retries=2`，
+     * 于是它绕过的那段累加逻辑恒为 0 也没人发现 —— 用 override 掩盖 bug
+     * 的测试比没有测试更危险。
+     */
+    protected open suspend fun generateOnce(
         prompt: String,
         model: String,
         size: String,
@@ -593,8 +623,11 @@ open class QwenImageClient(
      * 与 [generateOnce] 唯一的差别是 `files` 与源图排除表，因此共用
      * [imageStreamOnce] 而不另写一份流读取循环 —— 两份流循环意味着
      * 看门狗、超时、错误归一化都要维护两遍，必然分叉。
+     *
+     * `protected open` 同样**仅为测试可替换性**（见 [generateOnce]）：
+     * 图生图的重试计数只有在走真实 [generateImageEdit] 循环的用例里才被验证。
      */
-    private suspend fun generateEditOnce(
+    protected open suspend fun generateEditOnce(
         prompt: String,
         model: String,
         size: String,
@@ -639,6 +672,14 @@ open class QwenImageClient(
                 Regex("unauthorized|token", RegexOption.IGNORE_CASE).containsMatchIn(details)
             ) {
                 throw QwenException("AUTH_FAILED", "Token 无效或已过期: $details", 401)
+            }
+            // 建会话同样会被风控拦（实测处罚页的 url 就是 chats/completions 下的 punish 路径，
+            // 但某些形态会在 chats/new 这步就返回 ret 失败）。
+            if (RiskControl.hasUpstreamRiskSignature(details) ||
+                RiskControl.isRiskControlBlock(details)
+            ) {
+                logImage("create chat blocked by risk control")
+                throw QwenException(RiskControl.THROTTLE_CODE, RiskControl.HINT, 502)
             }
             throw QwenException(
                 Json.strOrNull(d, "code") ?: "CREATE_CHAT_FAIL",
@@ -698,11 +739,29 @@ open class QwenImageClient(
             if (status == 401 || status == 403) {
                 throw QwenException("AUTH_FAILED", "Token 无效或已过期 (HTTP $status)", 401)
             }
+            // 风控处罚页有时直接以非 200 返回。识别到就换成明确的风控码与中文提示，
+            // 不再走「可重试的 UPSTREAM_5xx」分支 —— 风控态下重试只会加重封禁。
+            if (RiskControl.hasUpstreamRiskSignature(t)) {
+                logImage("upstream risk control on HTTP $status")
+                throw QwenException(
+                    RiskControl.THROTTLE_CODE,
+                    "${RiskControl.HINT}（上游 HTTP $status）",
+                    502,
+                )
+            }
             throw QwenException("UPSTREAM_$status", "Qwen 返回 HTTP $status: " + t.take(150), 502)
         }
         // 上游有时用 HTTP 200 返回 JSON 错误体
         if (!ctype.contains("event-stream") && !ctype.contains("text/")) {
             val t = readRespText(resp)
+            if (RiskControl.hasUpstreamRiskSignature(t)) {
+                logImage("upstream risk control in 200 body")
+                throw QwenException(RiskControl.THROTTLE_CODE, RiskControl.HINT, 502)
+            }
+            if (RiskControl.isRiskControlBlock(t)) {
+                logImage("upstream throttle in 200 body")
+                throw QwenException(RiskControl.THROTTLE_CODE, RiskControl.HINT, 502)
+            }
             throw QwenException("UPSTREAM_ERROR", "Qwen 拒绝文生图请求: " + t.take(200), 502)
         }
 
@@ -740,12 +799,22 @@ open class QwenImageClient(
                         flags.lastDataAt = System.currentTimeMillis()
                         for (evt in parser.feed(line + "\n")) {
                             if (evt is ImageEvent.Error) {
-                                upstreamError = QwenException(
-                                    evt.code.ifEmpty { "UPSTREAM_ERROR" },
-                                    "Qwen 流中返回错误: ${evt.message}。若为风控/频率限制: " +
-                                        "请在浏览器打开 chat.qwen.ai 完成滑块验证或冷却几分钟后重试",
-                                    502,
-                                )
+                                // 流内错误帧是风控最典型的表现（HTTP 200 + 处罚页 JSON）。
+                                // 命中指纹就用统一的风控码，顺带把原始处罚页 JSON（含带
+                                // x5secdata 的 punish URL）换成中文提示，不再糊给终端用户。
+                                val risk = RiskControl.hasUpstreamRiskSignature(evt.message) ||
+                                    RiskControl.isRiskControlBlock(evt.code, evt.message)
+                                logImage("image stream error [${evt.code}] risk=$risk")
+                                upstreamError = if (risk) {
+                                    QwenException(RiskControl.THROTTLE_CODE, RiskControl.HINT, 502)
+                                } else {
+                                    QwenException(
+                                        evt.code.ifEmpty { "UPSTREAM_ERROR" },
+                                        "Qwen 流中返回错误: ${evt.message}。若为风控/频率限制: " +
+                                            "请在浏览器打开 chat.qwen.ai 完成滑块验证或冷却几分钟后重试",
+                                        502,
+                                    )
+                                }
                             }
                             onEvent?.invoke(evt)
                         }
@@ -863,3 +932,16 @@ internal class ImageStreamFlags {
 
     @Volatile var idleFired: Boolean = false
 }
+
+/**
+ * 带尝试次数的一次调用结果。
+ *
+ * 存在的唯一理由：让「重试了几次」成为重试包装层的**事实输出**，
+ * 而不是各调用方各自去凑。此前 `retries` 由单轮流结果透传，而那层没有
+ * 重试概念，累加源恒为 0 —— 对外回显的排查线索因此变成假的。
+ */
+internal class AttemptResult<T>(
+    val value: T,
+    /** 实际重试次数（0 = 首次即成功） */
+    val retries: Int,
+)

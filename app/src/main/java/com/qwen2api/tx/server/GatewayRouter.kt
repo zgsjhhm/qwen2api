@@ -21,6 +21,7 @@ import com.qwen2api.tx.core.ImageResult
 import com.qwen2api.tx.core.SourceImage
 import com.qwen2api.tx.core.ToolPrompt
 import com.qwen2api.tx.core.QwenException
+import com.qwen2api.tx.core.RiskControl
 import com.qwen2api.tx.core.Util
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -42,6 +43,16 @@ object GatewayState {
     @Volatile var reqCount: Long = 0L
 
     @Volatile var lastRequestLog: String = ""
+
+    /**
+     * 最近一条**图片链路**诊断日志（含请求体诊断与重试过程）。
+     *
+     * 与 [lastRequestLog] 分开：后者只在请求**结束时**写一行，而图片链路
+     * 真正的排查价值在过程中（重试了几轮、body 到底发了什么、源图上传成功没）。
+     * 分开后 `/admin/api/status` 能直接给出最近一条过程日志，
+     * 不必守着 logcat 复现。
+     */
+    @Volatile var lastImageLog: String = ""
 }
 
 /**
@@ -338,7 +349,29 @@ class GatewayRouter(
 
     private fun newClient(cfg: GatewayConfig) = clientFactory(cfg)
 
-    private fun newImageClient(cfg: GatewayConfig) = imageClientFactory(cfg)
+    /**
+     * 创建文生图客户端并**接上日志出口**。
+     *
+     * 这两个 sink 此前声明了却全仓零赋值，于是图片链路在 logcat 里一行都没有：
+     * 发真实文生图（含 4 次重试）只看到基类打的 `REQ/DELETE /api/v2/chats/new`，
+     * `t2i payload: …`、`edit source uploaded: …`、`retryable […]` 全部静默。
+     * 排查「上游说 Model not found」时最需要的恰恰是这些行，结果是「像代码没执行」。
+     *
+     * 接线点放在这里而不是客户端内部：客户端跑在网关进程里，不该依赖
+     * android.util.Log（单测会抛 `RuntimeException: Stub!`），日志出口由网关提供。
+     * 同时记一份到 [GatewayState.lastImageLog]，让 `/admin/api/status` 也能读到
+     * 最近一条图片链路日志 —— 手机上看 logcat 并不总是方便。
+     */
+    private fun newImageClient(cfg: GatewayConfig): QwenImageClient {
+        val client = imageClientFactory(cfg)
+        val sink: (String) -> Unit = { msg ->
+            GatewayState.lastImageLog = msg
+            debugLog("IMG $msg")
+        }
+        client.logSink = sink
+        client.payloadDebugSink = sink
+        return client
+    }
 
     private fun parseMessages(body: JSONObject): MutableList<ChatMessage> {
         val arr = Json.arr(body, "messages") ?: return ArrayList()
@@ -590,6 +623,8 @@ class GatewayRouter(
                 "model" to result.model,
                 "size" to result.size,
                 "caption" to result.caption,
+                // 与 edits 对齐：排查「偶发 502」时必须能看出网关重试了没有
+                "retries" to result.retries,
                 "downloaded_b64" to if (wantB64) {
                     data.count { (it["b64_json"] as? String).orEmpty().isNotEmpty() }
                 } else {
@@ -602,7 +637,10 @@ class GatewayRouter(
             val err = if (e is QwenException) e else {
                 val (c, m, s) = Util.normalizeError(e); QwenException(c, m, s)
             }
-            logReq(req, err.status, System.currentTimeMillis() - t0, "[${err.code}]")
+            logReq(
+                req, err.status, System.currentTimeMillis() - t0,
+                "[${err.code}] retries=${err.attempts}",
+            )
             sendError(res, err)
         }
     }
@@ -862,7 +900,10 @@ class GatewayRouter(
             val err = if (e is QwenException) e else {
                 val (c, m, s) = Util.normalizeError(e); QwenException(c, m, s)
             }
-            logReq(req, err.status, System.currentTimeMillis() - t0, "[${err.code}]")
+            logReq(
+                req, err.status, System.currentTimeMillis() - t0,
+                "[${err.code}] retries=${err.attempts}",
+            )
             sendError(res, err)
         }
     }
@@ -1665,6 +1706,10 @@ class GatewayRouter(
                         "qwenCheckAt" to GatewayState.qwenCheckAt,
                         "models" to models.map { linkedMapOf("id" to it.id, "name" to it.name) },
                         "reqCount" to GatewayState.reqCount,
+                        // 图片链路最近一条过程日志（重试/payload/源图上传）。
+                        // 图片链路的失败原因常常只能在这几行里看出来，
+                        // 而手机上看 logcat 并不方便，所以顺手透到状态接口。
+                        "lastImageLog" to GatewayState.lastImageLog,
                         // 存储加密是否降级。
                         // SecretVault.lastDegraded 此前只被写入、**没有任何消费者**，
                         // 于是"apiKey/qwenToken 正在以明文落盘"这件事实对用户完全不可见。
@@ -1909,45 +1954,20 @@ class GatewayRouter(
         /**
          * 风控/频率限制错误识别。
          *
-         * 参考 qwenstudiopp v1.3.0 的 isThrottleError：
-         *  - 覆盖 429 / rate limit / 风控 / 滑块 / baxia(阿里盾) / 稍后 / 频繁 等措辞
-         *  - **必须包含 UPSTREAM_EMPTY**：上游被风控掐断时最典型的表现就是
-         *    「流正常建立但没有任何内容」，若不识别会导致静默失败（无回应）。
-         *  - 明确排除业务类错误（鉴权/参数/文件），避免无意义重试。
+         * 判据**实现在 [com.qwen2api.tx.core.RiskControl]**，这里只做转发：
+         * 图片客户端在 core 包、不能反向依赖 server，而「哪些措辞算风控」
+         * 一旦有两份实现必然分叉 —— 实测过的代价是文本链路认得出阿里盾处罚页、
+         * 图片链路却把它当瞬时故障重试 4 次（同一请求 8s 变 58s）。
+         * 保留这层转发是为了不动既有的 `GatewayRouter.isRiskControlBlock` 调用点。
          */
-        private val THROTTLE_PAT = Regex(
-            "429|rate.?limit|too.?many|throttl|风控|频率|滑块|baxia|busy|overload|try.?again|稍后|频繁|" +
-                "fail_sys_user_validate|rgv587|punish|x5sec|被挤爆",
-            RegexOption.IGNORE_CASE,
-        )
-
-        private val NON_RETRYABLE = setOf(
-            "AUTH_FAILED", "NO_TOKEN", "BAD_REQUEST", "FILE_TOO_LARGE",
-            "PARSE_FAILED", "TOKEN_INVALID_CHARS", "HEADER_INVALID_CHARS", "NETWORK_TIMEOUT",
-        )
-
-        fun isRiskControlBlock(msg: String?): Boolean {
-            if (msg.isNullOrEmpty()) return false
-            if (msg in NON_RETRYABLE) return false
-            return THROTTLE_PAT.containsMatchIn(msg)
-        }
+        fun isRiskControlBlock(msg: String?): Boolean = RiskControl.isRiskControlBlock(msg)
 
         /** 带错误码的判定（优先看 code，其次看 message）。 */
-        fun isRiskControlBlock(code: String?, msg: String?): Boolean {
-            if (!code.isNullOrEmpty()) {
-                if (code in NON_RETRYABLE) return false
-                if (code == "UPSTREAM_429" || code == "UPSTREAM_EMPTY" ||
-                    code == "THROTTLE_RATE_LIMIT"
-                ) {
-                    return true
-                }
-                if (THROTTLE_PAT.containsMatchIn(code)) return true
-            }
-            return isRiskControlBlock(msg)
-        }
+        fun isRiskControlBlock(code: String?, msg: String?): Boolean =
+            RiskControl.isRiskControlBlock(code, msg)
 
         /** 折中等待阶梯（毫秒）：8s / 15s / 25s —— 兼顾成功率与响应速度。 */
-        val THROTTLE_WAIT_STEPS_MS = longArrayOf(8_000, 15_000, 25_000)
+        val THROTTLE_WAIT_STEPS_MS: LongArray = RiskControl.WAIT_STEPS_MS
 
         /** 风控拦截时给用户的友好中文提示（替代原始的处罚页 JSON）。 */
         const val RISK_CONTROL_HINT =
