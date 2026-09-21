@@ -95,6 +95,17 @@ open class QwenClient(
     private val qwenToken: String,
     private val throttleMs: Int,
 ) {
+    /**
+     * 上游根地址。默认即生产地址，**只在测试里**被指向本地假上游。
+     *
+     * 存在的理由：错误分流（风控 / 配额用尽 / 普通 5xx）的判据只有在拿到
+     * **真实形态的响应体**时才能验证 —— 这些分支在既有测试里全被
+     * "override 掉整个方法"的假实现绕过了，于是「额度用尽被当成风控」
+     * 这类错误在真实调用前一直不可见。可替换基址让假上游返回逐字节相同的
+     * 响应体，才谈得上回归。
+     */
+    var baseUrl: String = QWEN_BASE
+
     companion object {
         const val QWEN_BASE = "https://chat.qwen.ai"
         const val UA =
@@ -377,7 +388,7 @@ open class QwenClient(
         }
         throttle()
 
-        val builder = Request.Builder().url(QWEN_BASE + pathname)
+        val builder = Request.Builder().url(baseUrl + pathname)
         for ((k, v) in headers(extraHeaders)) builder.header(k, v)
         when (method.uppercase()) {
             "POST" -> builder.post((body ?: "").toRequestBody(JSON_MT))
@@ -508,6 +519,12 @@ open class QwenClient(
             )
             if (status == 401 || status == 403 || Regex("unauthorized|token", RegexOption.IGNORE_CASE).containsMatchIn(details)) {
                 throw QwenException("AUTH_FAILED", "Token 无效或已过期: $details", 401)
+            }
+            // 建会话同样会被配额/风控拦，且上游把两者编码进同一个 `RateLimited`
+            // 家族 —— 分流统一走 RiskControl.blockCode（配额优先，两者处置建议相反）。
+            val blocked = RiskControl.blockCode(details) ?: RiskControl.blockCode(code)
+            if (blocked != null) {
+                throw QwenException(blocked, RiskControl.hintFor(blocked), 502)
             }
             throw QwenException(code, "创建聊天失败: " + details.ifEmpty { code }, 502)
         }
@@ -935,6 +952,14 @@ open class QwenClient(
                 if (Regex("token|unauthorized", RegexOption.IGNORE_CASE).containsMatchIn(details + code)) {
                     throw QwenException("AUTH_FAILED", "Token 无效或已过期: $details", 401)
                 }
+                // 额度用尽与风控/限流的处置建议相反（等明天 vs 过滑块），
+                // 且上游把它编码成 `RateLimited` —— 字面与"限流"同族。
+                // 不先摘出来会被上层当风控走 8/15/25s 等待重试，
+                // 而它今天之内重试多少次都是同一结果。
+                val blocked = RiskControl.blockCode(details) ?: RiskControl.blockCode(code)
+                if (blocked == RiskControl.QUOTA_CODE) {
+                    throw QwenException(blocked, RiskControl.hintFor(blocked), 502)
+                }
             }
             throw QwenException(code, "Qwen 拒绝请求: $details", 502)
         }
@@ -989,14 +1014,23 @@ open class QwenClient(
                                 is QwenEvent.SearchDocs -> docList.addAll(evt.docs)
                                 is QwenEvent.SearchQueries -> queries = evt.queries
                                 is QwenEvent.UpstreamError -> {
-                                    upstreamError = QwenException(
-                                        evt.code.ifEmpty { "UPSTREAM_ERROR" },
-                                        "Qwen 流中返回错误: ${evt.message}" +
-                                            (if (parser.thinking.isNotEmpty()) " (思考已输出 ${parser.thinking.length} 字)" else "") +
-                                            (if (answer.isNotEmpty()) " (正文已接收 ${answer.length} 字, 客户端已保留)" else "") +
-                                            "。若为风控/频率限制: 请在浏览器打开 chat.qwen.ai 完成滑块验证或冷却几分钟后重试",
-                                        502,
-                                    )
+                                    // 配额用尽与风控都会走错误帧，但给用户的处置建议完全相反。
+                                    // 上游把两者都编码进 200 的正文，因此必须在这里分流，
+                                    // 否则「额度用尽」会被附上一句「请完成滑块验证」的无效建议。
+                                    val quota = RiskControl.isQuotaExhausted(evt.message) ||
+                                        RiskControl.isQuotaExhausted(evt.code)
+                                    upstreamError = if (quota) {
+                                        QwenException(RiskControl.QUOTA_CODE, RiskControl.QUOTA_HINT, 502)
+                                    } else {
+                                        QwenException(
+                                            evt.code.ifEmpty { "UPSTREAM_ERROR" },
+                                            "Qwen 流中返回错误: ${evt.message}" +
+                                                (if (parser.thinking.isNotEmpty()) " (思考已输出 ${parser.thinking.length} 字)" else "") +
+                                                (if (answer.isNotEmpty()) " (正文已接收 ${answer.length} 字, 客户端已保留)" else "") +
+                                                "。若为风控/频率限制: 请在浏览器打开 chat.qwen.ai 完成滑块验证或冷却几分钟后重试",
+                                            502,
+                                        )
+                                    }
                                 }
                                 else -> Unit
                             }
@@ -1029,6 +1063,12 @@ open class QwenClient(
                             ?: Json.strOrNull(j, "message"),
                         300,
                     ).ifEmpty { details }
+                }
+                // 同上：流尾部形态的错误也要先把「额度用尽」摘出来，
+                // 否则会被上层的风控重试逻辑接走，白等 8/15/25s。
+                val blocked = RiskControl.blockCode(details) ?: RiskControl.blockCode(code)
+                if (blocked == RiskControl.QUOTA_CODE) {
+                    throw QwenException(blocked, RiskControl.hintFor(blocked), 502)
                 }
                 throw QwenException(code, "Qwen 拒绝请求: $details", 502)
             }

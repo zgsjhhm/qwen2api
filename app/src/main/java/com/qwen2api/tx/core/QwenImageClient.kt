@@ -532,6 +532,10 @@ open class QwenImageClient(
         // 实测同一风控响应下 retry=4 耗时 58s、retry=0 耗时 8s，错误完全一样 ——
         // 多出来的 50s 只是把上游打得更多，而风控正是按请求数判定的。
         RiskControl.THROTTLE_CODE,
+        // 配额用尽：上游明说"请明天再试"，今天之内重试多少次都是同一个结果。
+        // 显式列出而不是依赖名字不匹配 `UPSTREAM_5*` 的默认分支 ——
+        // 那种"碰巧不重试"不是设计，改个码名就会静默变成重试。
+        RiskControl.QUOTA_CODE,
         -> false
         else -> code.startsWith("UPSTREAM_5") ||
             code.startsWith("NETWORK") ||
@@ -673,13 +677,14 @@ open class QwenImageClient(
             ) {
                 throw QwenException("AUTH_FAILED", "Token 无效或已过期: $details", 401)
             }
-            // 建会话同样会被风控拦（实测处罚页的 url 就是 chats/completions 下的 punish 路径，
-            // 但某些形态会在 chats/new 这步就返回 ret 失败）。
-            if (RiskControl.hasUpstreamRiskSignature(details) ||
-                RiskControl.isRiskControlBlock(details)
-            ) {
-                logImage("create chat blocked by risk control")
-                throw QwenException(RiskControl.THROTTLE_CODE, RiskControl.HINT, 502)
+            // 建会话同样会被风控/配额拦（实测处罚页的 url 就是 chats/completions 下的
+            // punish 路径，但某些形态会在 chats/new 这步就返回 ret 失败）。
+            // 分流只经 RiskControl.blockCode：配额与风控的处置建议相反，优先级
+            // 必须单点定义，否则漏一处就退化成"额度用尽被建议去过滑块"。
+            val blocked = RiskControl.blockCode(details)
+            if (blocked != null) {
+                logImage("create chat blocked [$blocked]: $details")
+                throw QwenException(blocked, RiskControl.hintFor(blocked), 502)
             }
             throw QwenException(
                 Json.strOrNull(d, "code") ?: "CREATE_CHAT_FAIL",
@@ -739,28 +744,27 @@ open class QwenImageClient(
             if (status == 401 || status == 403) {
                 throw QwenException("AUTH_FAILED", "Token 无效或已过期 (HTTP $status)", 401)
             }
-            // 风控处罚页有时直接以非 200 返回。识别到就换成明确的风控码与中文提示，
+            // 风控处罚页有时直接以非 200 返回。识别到就换成明确的原因码与中文提示，
             // 不再走「可重试的 UPSTREAM_5xx」分支 —— 风控态下重试只会加重封禁。
-            if (RiskControl.hasUpstreamRiskSignature(t)) {
-                logImage("upstream risk control on HTTP $status")
-                throw QwenException(
-                    RiskControl.THROTTLE_CODE,
-                    "${RiskControl.HINT}（上游 HTTP $status）",
-                    502,
-                )
+            // 配额/风控的分流见 RiskControl.blockCode（两者处置建议相反）。
+            val blocked = RiskControl.blockCode(t)
+            if (blocked != null) {
+                logImage("upstream blocked [$blocked] on HTTP $status")
+                throw QwenException(blocked, "${RiskControl.hintFor(blocked)}（上游 HTTP $status）", 502)
             }
             throw QwenException("UPSTREAM_$status", "Qwen 返回 HTTP $status: " + t.take(150), 502)
         }
         // 上游有时用 HTTP 200 返回 JSON 错误体
         if (!ctype.contains("event-stream") && !ctype.contains("text/")) {
             val t = readRespText(resp)
-            if (RiskControl.hasUpstreamRiskSignature(t)) {
-                logImage("upstream risk control in 200 body")
-                throw QwenException(RiskControl.THROTTLE_CODE, RiskControl.HINT, 502)
-            }
-            if (RiskControl.isRiskControlBlock(t)) {
-                logImage("upstream throttle in 200 body")
-                throw QwenException(RiskControl.THROTTLE_CODE, RiskControl.HINT, 502)
+            // 这条分支是「真风控 / 配额用尽 / 检测器误判」唯一能分清的地方：
+            // 只记一句结论会让截然不同的故障在日志里长得一模一样（此前正是如此，
+            // 「额度用尽」被记成「风控」，排查方向被带偏）。正文截断避免刷屏。
+            logImage("t2i non-SSE 200: ctype=$ctype body=" + t.take(600).replace('\n', ' '))
+            val blocked = RiskControl.blockCode(t)
+            if (blocked != null) {
+                logImage("upstream blocked [$blocked] in 200 body")
+                throw QwenException(blocked, RiskControl.hintFor(blocked), 502)
             }
             throw QwenException("UPSTREAM_ERROR", "Qwen 拒绝文生图请求: " + t.take(200), 502)
         }
@@ -799,14 +803,19 @@ open class QwenImageClient(
                         flags.lastDataAt = System.currentTimeMillis()
                         for (evt in parser.feed(line + "\n")) {
                             if (evt is ImageEvent.Error) {
-                                // 流内错误帧是风控最典型的表现（HTTP 200 + 处罚页 JSON）。
-                                // 命中指纹就用统一的风控码，顺带把原始处罚页 JSON（含带
-                                // x5secdata 的 punish URL）换成中文提示，不再糊给终端用户。
-                                val risk = RiskControl.hasUpstreamRiskSignature(evt.message) ||
-                                    RiskControl.isRiskControlBlock(evt.code, evt.message)
-                                logImage("image stream error [${evt.code}] risk=$risk")
-                                upstreamError = if (risk) {
-                                    QwenException(RiskControl.THROTTLE_CODE, RiskControl.HINT, 502)
+                                // 流内错误帧是风控最典型的表现（HTTP 200 + 处罚页 JSON），
+                                // 但**同一形态也可能是配额用尽**（上游把两者都放在 200 的
+                                // JSON body 里）。分流统一走 RiskControl.blockCode：
+                                // 两者给用户的处置建议正好相反（等明天 vs 过滑块）。
+                                val blocked = RiskControl.blockCode(evt.message)
+                                    ?: if (RiskControl.isRiskControlBlock(evt.code, evt.message)) {
+                                        RiskControl.THROTTLE_CODE
+                                    } else {
+                                        null
+                                    }
+                                logImage("image stream error [${evt.code}] blocked=$blocked")
+                                upstreamError = if (blocked != null) {
+                                    QwenException(blocked, RiskControl.hintFor(blocked), 502)
                                 } else {
                                     QwenException(
                                         evt.code.ifEmpty { "UPSTREAM_ERROR" },
